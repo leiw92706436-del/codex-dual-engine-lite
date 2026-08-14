@@ -889,8 +889,26 @@ test_retry_execute() {
     "task_id=$task_id"
   assert "retry execution writes a private log" test -f "$attempt_dir/retry.log"
   assert "retry execution writes a reviewable package" test -f "$attempt_dir/EXECUTION.json"
+  assert "retry execution writes the complete after patch" test -f "$attempt_dir/after.patch"
+  assert "retry execution writes the after file list" test -f "$attempt_dir/after-files.txt"
+  assert "retry execution writes the retry-only delta patch" test -f "$attempt_dir/delta.patch"
+  assert "retry execution writes the retry-only delta file list" test -f "$attempt_dir/delta-files.txt"
   assert_eq "retry log is mode 0600" 600 "$(perm_octal "$attempt_dir/retry.log")"
   assert_eq "retry execution package is mode 0600" 600 "$(perm_octal "$attempt_dir/EXECUTION.json")"
+  assert_eq "after patch is mode 0600" 600 "$(perm_octal "$attempt_dir/after.patch")"
+  assert_eq "after file list is mode 0600" 600 "$(perm_octal "$attempt_dir/after-files.txt")"
+  assert_eq "delta patch is mode 0600" 600 "$(perm_octal "$attempt_dir/delta.patch")"
+  assert_eq "delta file list is mode 0600" 600 "$(perm_octal "$attempt_dir/delta-files.txt")"
+  assert_contains "after patch preserves the original untracked file" \
+    "$(cat "$attempt_dir/after.patch")" "stub new file"
+  assert_contains "after patch preserves the original binary file" \
+    "$(cat "$attempt_dir/after.patch")" "GIT binary patch"
+  assert_eq "retry-only delta names one changed file" "src/hello.txt" \
+    "$(cat "$attempt_dir/delta-files.txt")"
+  assert_contains "retry-only delta contains the runner change" \
+    "$(cat "$attempt_dir/delta.patch")" "STUB CHANGE"
+  assert_not_contains "retry-only delta excludes unchanged untracked content" \
+    "$(cat "$attempt_dir/delta.patch")" "stub new file"
   execution=$(cat "$attempt_dir/EXECUTION.json")
   assert_contains "retry execution package uses v1 schema" "$execution" \
     '"schema": "dual-engine-retry-execution.v1"'
@@ -900,6 +918,14 @@ test_retry_execute() {
     '"stop_reason": "process_exit"'
   assert_contains "retry execution package records no budget breach" "$execution" \
     '"budget_exceeded": false'
+  assert_contains "retry execution package records after file count" "$execution" \
+    '"after_changed_file_count": 3'
+  assert_contains "retry execution package records delta file count" "$execution" \
+    '"delta_changed_file_count": 1'
+  assert_contains "retry execution package records the after patch hash" "$execution" \
+    "\"after_patch_sha256\": \"$(shasum -a 256 "$attempt_dir/after.patch" | awk '{print $1}')\""
+  assert_contains "retry execution package records the delta patch hash" "$execution" \
+    "\"delta_patch_sha256\": \"$(shasum -a 256 "$attempt_dir/delta.patch" | awk '{print $1}')\""
   assert_eq "retry execution leaves source HEAD unchanged" "$head_before" "$(git -C "$repo" rev-parse HEAD)"
   assert_eq "retry execution leaves source repository clean" "" "$(git -C "$repo" status --porcelain)"
 
@@ -961,6 +987,7 @@ test_retry_execute() {
     '"stop_reason": "process_exit"'
   assert_contains "nonzero retry execution is not a budget breach" "$execution" \
     '"budget_exceeded": false'
+  assert "nonzero retry execution preserves a delta patch" test -f "$attempt_dir/delta.patch"
 
   task_id=$(new_retry_task retry-execute-runtime "$correction")
   attempt_dir="$TEST_DATA/tasks/$task_id/result/retry/attempt-1"
@@ -975,6 +1002,7 @@ test_retry_execute() {
     '"stop_reason": "runtime_limit_exceeded"'
   assert_contains "runtime-stopped retry records budget breach" "$execution" \
     '"budget_exceeded": true'
+  assert "runtime-stopped retry preserves a delta patch" test -f "$attempt_dir/delta.patch"
 
   task_id=$(new_retry_task retry-execute-log "$correction")
   attempt_dir="$TEST_DATA/tasks/$task_id/result/retry/attempt-1"
@@ -991,6 +1019,7 @@ test_retry_execute() {
     '"stop_reason": "log_size_limit_exceeded"'
   assert_contains "log-stopped retry records budget breach" "$execution" \
     '"budget_exceeded": true'
+  assert "log-stopped retry preserves a delta patch" test -f "$attempt_dir/delta.patch"
 }
 
 # --- 8. cleanup validation and preservation ------------------------------

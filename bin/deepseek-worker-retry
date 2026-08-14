@@ -96,6 +96,75 @@ json_int_value() {
   sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$path"
 }
 
+build_worktree_snapshot() {
+  local base="$1" patch_out="$2" files_out="$3" tracked_out="$4" untracked_out="$5" unsorted_out="$6"
+  local rel diff_rc
+
+  git -c core.quotePath=false -C "$worktree" diff --name-only -z "$base" -- > "$tracked_out" \
+    || die "failed to enumerate tracked changes" 1
+  git -c core.quotePath=false -C "$worktree" ls-files --others --exclude-standard -z > "$untracked_out" \
+    || die "failed to enumerate untracked changes" 1
+  git -C "$worktree" diff --binary --no-ext-diff --find-renames "$base" -- > "$patch_out" \
+    || die "failed to snapshot tracked changes" 1
+  : > "$unsorted_out"
+
+  while IFS= read -r -d '' rel; do
+    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+      || die "changed path cannot be represented safely" 1
+    printf '%s\n' "$rel" >> "$unsorted_out"
+  done < "$tracked_out"
+
+  while IFS= read -r -d '' rel; do
+    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+      || die "changed path cannot be represented safely" 1
+    [[ -f "$worktree/$rel" || -L "$worktree/$rel" ]] \
+      || die "unsupported untracked file type: $rel" 1
+    printf '%s\n' "$rel" >> "$unsorted_out"
+    if git -c core.quotePath=false -C "$worktree" diff --no-index --binary --no-ext-diff -- /dev/null "$rel" \
+      >> "$patch_out" 2>/dev/null; then
+      :
+    else
+      diff_rc=$?
+      [[ "$diff_rc" == "1" ]] || die "failed to snapshot untracked file: $rel" 1
+    fi
+  done < "$untracked_out"
+
+  LC_ALL=C sort -u "$unsorted_out" > "$files_out" \
+    || die "failed to normalize changed-file list" 1
+}
+
+reconstruct_tree_from_patch() {
+  local base="$1" patch_path="$2" index_path="$3" description="$4"
+  local tree
+
+  GIT_INDEX_FILE="$index_path" git -C "$worktree" read-tree "$base" \
+    || die "failed to initialize $description index from base HEAD" 1
+  GIT_INDEX_FILE="$index_path" git -C "$worktree" apply --cached --allow-empty --binary "$patch_path" \
+    || die "failed to reconstruct $description state from $patch_path against base HEAD" 1
+  tree=$(GIT_INDEX_FILE="$index_path" git -C "$worktree" write-tree) \
+    || die "failed to write $description tree" 1
+  [[ "$tree" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || die "failed to write $description tree" 1
+  printf '%s\n' "$tree"
+}
+
+build_tree_delta() {
+  local before_tree="$1" after_tree="$2" patch_out="$3" files_out="$4" raw_out="$5" unsorted_out="$6"
+  local rel
+
+  git -C "$worktree" diff --binary --no-ext-diff --find-renames "$before_tree" "$after_tree" -- > "$patch_out" \
+    || die "failed to build retry delta patch" 1
+  git -c core.quotePath=false -C "$worktree" diff --name-only -z "$before_tree" "$after_tree" -- > "$raw_out" \
+    || die "failed to enumerate retry delta files" 1
+  : > "$unsorted_out"
+  while IFS= read -r -d '' rel; do
+    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+      || die "retry delta path cannot be represented safely" 1
+    printf '%s\n' "$rel" >> "$unsorted_out"
+  done < "$raw_out"
+  LC_ALL=C sort -u "$unsorted_out" > "$files_out" \
+    || die "failed to normalize retry delta file list" 1
+}
+
 execute_retry_run() {
   local prepared="$attempt_dir/PREPARED.json"
   local patch="$attempt_dir/before.patch"
@@ -103,6 +172,10 @@ execute_retry_run() {
   local task_file="$attempt_dir/task.txt"
   local logfile="$attempt_dir/retry.log"
   local execution_file="$attempt_dir/EXECUTION.json"
+  local after_patch="$attempt_dir/after.patch"
+  local after_files="$attempt_dir/after-files.txt"
+  local delta_patch="$attempt_dir/delta.patch"
+  local delta_files="$attempt_dir/delta-files.txt"
 
   [[ -d "$retry_dir" && ! -L "$retry_dir" ]] \
     || die "retry directory is not a real directory: $retry_dir" 1
@@ -129,6 +202,13 @@ execute_retry_run() {
   if [[ -e "$execution_file" || -L "$execution_file" ]]; then
     die "retry execution package already exists: $execution_file" 1
   fi
+
+  local after_artifact
+  for after_artifact in "$after_patch" "$after_files" "$delta_patch" "$delta_files"; do
+    if [[ -e "$after_artifact" || -L "$after_artifact" ]]; then
+      die "retry after-state artifact already exists: $after_artifact" 1
+    fi
+  done
 
   local count schema_value version_value task_value base_value
   local sha_value count_value status_value actual_sha actual_count
@@ -194,45 +274,21 @@ execute_retry_run() {
   local unsorted_files="$retry_validation_tmp/.before-files.unsorted"
   local current_patch="$retry_validation_tmp/current.patch"
   local current_files="$retry_validation_tmp/current-files.txt"
+  local before_index="$retry_validation_tmp/.before.index"
+  local before_tree=""
 
-  git -c core.quotePath=false -C "$worktree" diff --name-only -z HEAD -- > "$tracked_paths" \
-    || die "failed to enumerate tracked changes" 1
-  git -c core.quotePath=false -C "$worktree" ls-files --others --exclude-standard -z > "$untracked_paths" \
-    || die "failed to enumerate untracked changes" 1
-  git -C "$worktree" diff --binary --no-ext-diff --find-renames HEAD -- > "$current_patch" \
-    || die "failed to snapshot tracked changes" 1
-  : > "$unsorted_files"
-
-  local rel diff_rc
-  while IFS= read -r -d '' rel; do
-    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
-      || die "changed path cannot be represented safely" 1
-    printf '%s\n' "$rel" >> "$unsorted_files"
-  done < "$tracked_paths"
-
-  while IFS= read -r -d '' rel; do
-    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
-      || die "changed path cannot be represented safely" 1
-    [[ -f "$worktree/$rel" || -L "$worktree/$rel" ]] \
-      || die "unsupported untracked file type: $rel" 1
-    printf '%s\n' "$rel" >> "$unsorted_files"
-    if git -c core.quotePath=false -C "$worktree" diff --no-index --binary --no-ext-diff -- /dev/null "$rel" \
-      >> "$current_patch" 2>/dev/null; then
-      :
-    else
-      diff_rc=$?
-      [[ "$diff_rc" == "1" ]] || die "failed to snapshot untracked file: $rel" 1
-    fi
-  done < "$untracked_paths"
-
-  LC_ALL=C sort -u "$unsorted_files" > "$current_files" \
-    || die "failed to normalize changed-file list" 1
+  build_worktree_snapshot "$worktree_head" "$current_patch" "$current_files" \
+    "$tracked_paths" "$untracked_paths" "$unsorted_files"
   chmod 600 "$tracked_paths" "$untracked_paths" "$unsorted_files" "$current_patch" "$current_files"
 
   cmp -s "$current_patch" "$patch" \
     || die "current worktree snapshot does not match before.patch" 1
   cmp -s "$current_files" "$files" \
     || die "current normalized file list does not match before-files.txt" 1
+
+  before_tree=$(reconstruct_tree_from_patch "$worktree_head" "$patch" "$before_index" "before") \
+    || die "before.patch could not be reconstructed against base HEAD" 1
+  chmod 600 "$before_index" 2>/dev/null || true
 
   local input_file="$retry_validation_tmp/input.txt"
   cat "$task_file" > "$input_file" || die "failed to build runner input" 1
@@ -337,6 +393,51 @@ EOF
     budget_exceeded="true"
   fi
 
+  local source_head_after source_status_after
+  source_head_after=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)
+  [[ "$source_head_after" == "$source_head" ]] \
+    || die "source repository HEAD changed during retry execution" 1
+  if ! source_status_after=$(git -C "$repo_root" status --porcelain 2>/dev/null); then
+    die "cannot verify source repository cleanliness after retry execution" 1
+  fi
+  [[ -z "$source_status_after" ]] \
+    || die "source repository became dirty during retry execution" 1
+
+  local after_patch_tmp="$retry_validation_tmp/after.patch"
+  local after_files_tmp="$retry_validation_tmp/after-files.txt"
+  local after_tracked="$retry_validation_tmp/.after-tracked-paths"
+  local after_untracked="$retry_validation_tmp/.after-untracked-paths"
+  local after_unsorted="$retry_validation_tmp/.after-files.unsorted"
+  local after_index="$retry_validation_tmp/.after.index"
+  local after_tree=""
+  local delta_patch_tmp="$retry_validation_tmp/delta.patch"
+  local delta_files_tmp="$retry_validation_tmp/delta-files.txt"
+  local delta_raw="$retry_validation_tmp/.delta-paths"
+  local delta_unsorted="$retry_validation_tmp/.delta-files.unsorted"
+
+  build_worktree_snapshot "$worktree_head" "$after_patch_tmp" "$after_files_tmp" \
+    "$after_tracked" "$after_untracked" "$after_unsorted"
+  after_tree=$(reconstruct_tree_from_patch "$worktree_head" "$after_patch_tmp" "$after_index" "after") \
+    || die "after.patch could not be reconstructed against base HEAD" 1
+  build_tree_delta "$before_tree" "$after_tree" "$delta_patch_tmp" "$delta_files_tmp" \
+    "$delta_raw" "$delta_unsorted"
+
+  chmod 600 "$after_patch_tmp" "$after_files_tmp" "$after_tracked" "$after_untracked" \
+    "$after_unsorted" "$after_index" "$delta_patch_tmp" "$delta_files_tmp" \
+    "$delta_raw" "$delta_unsorted" 2>/dev/null || true
+
+  local after_patch_sha after_changed_count delta_patch_sha delta_changed_count
+  after_patch_sha=$(shasum -a 256 "$after_patch_tmp" | awk '{print $1}') \
+    || die "failed to compute after.patch SHA-256" 1
+  delta_patch_sha=$(shasum -a 256 "$delta_patch_tmp" | awk '{print $1}') \
+    || die "failed to compute delta.patch SHA-256" 1
+  [[ "$after_patch_sha" =~ ^[0-9a-fA-F]{64}$ ]] || die "failed to compute after.patch SHA-256" 1
+  [[ "$delta_patch_sha" =~ ^[0-9a-fA-F]{64}$ ]] || die "failed to compute delta.patch SHA-256" 1
+  after_changed_count=$(wc -l < "$after_files_tmp" | tr -d ' ')
+  delta_changed_count=$(wc -l < "$delta_files_tmp" | tr -d ' ')
+  [[ "$after_changed_count" =~ ^[0-9]+$ ]] || die "failed to count after-files.txt" 1
+  [[ "$delta_changed_count" =~ ^[0-9]+$ ]] || die "failed to count delta-files.txt" 1
+
   local status
   if [[ "$runner_rc" == "0" && "$budget_exceeded" == "false" ]]; then
     status="COMPLETE"
@@ -356,10 +457,19 @@ EOF
     printf '  "started_at": "%s",\n' "$(json_escape "$started_at")"
     printf '  "finished_at": "%s",\n' "$(json_escape "$finished_at")"
     printf '  "log_bytes": %s,\n' "$final_log_bytes"
+    printf '  "after_patch_sha256": "%s",\n' "$(json_escape "$after_patch_sha")"
+    printf '  "after_changed_file_count": %s,\n' "$after_changed_count"
+    printf '  "delta_patch_sha256": "%s",\n' "$(json_escape "$delta_patch_sha")"
+    printf '  "delta_changed_file_count": %s,\n' "$delta_changed_count"
     printf '  "status": "%s"\n' "$(json_escape "$status")"
     printf '}\n'
   } > "$execution_tmp" || die "failed to write execution package" 1
   chmod 600 "$execution_tmp"
+
+  mv -- "$after_patch_tmp" "$after_patch" || die "failed to publish after.patch" 1
+  mv -- "$after_files_tmp" "$after_files" || die "failed to publish after-files.txt" 1
+  mv -- "$delta_patch_tmp" "$delta_patch" || die "failed to publish delta.patch" 1
+  mv -- "$delta_files_tmp" "$delta_files" || die "failed to publish delta-files.txt" 1
   mv -- "$execution_tmp" "$execution_file" || die "failed to publish execution package" 1
 
   rm -rf -- "$retry_validation_tmp"
