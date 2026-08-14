@@ -74,14 +74,312 @@ marker_field() {
   printf '%s\n' "$value"
 }
 
+cleanup_retry_validation() {
+  if [[ -n "${retry_validation_tmp:-}" ]]; then
+    rm -rf -- "$retry_validation_tmp"
+    retry_validation_tmp=""
+  fi
+}
+
+json_field_count() {
+  local path="$1" key="$2"
+  grep -cE "^[[:space:]]*\"$key\"[[:space:]]*:" "$path" 2>/dev/null || true
+}
+
+json_string_value() {
+  local path="$1" key="$2"
+  sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$path"
+}
+
+json_int_value() {
+  local path="$1" key="$2"
+  sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$path"
+}
+
+execute_retry_run() {
+  local prepared="$attempt_dir/PREPARED.json"
+  local patch="$attempt_dir/before.patch"
+  local files="$attempt_dir/before-files.txt"
+  local task_file="$attempt_dir/task.txt"
+  local logfile="$attempt_dir/retry.log"
+  local execution_file="$attempt_dir/EXECUTION.json"
+
+  [[ -d "$retry_dir" && ! -L "$retry_dir" ]] \
+    || die "retry directory is not a real directory: $retry_dir" 1
+  [[ -d "$attempt_dir" && ! -L "$attempt_dir" ]] \
+    || die "retry attempt directory is missing or unsafe: $attempt_dir" 1
+  chmod 700 "$retry_dir" "$attempt_dir" 2>/dev/null || true
+
+  local artifact
+  for artifact in "$task_file" "$patch" "$files" "$prepared"; do
+    [[ -f "$artifact" && ! -L "$artifact" ]] \
+      || die "required retry artifact is missing or unsafe: $artifact" 1
+  done
+  chmod 600 "$task_file" "$patch" "$files" "$prepared" 2>/dev/null || true
+
+  local correction_bytes
+  correction_bytes=$(file_size "$task_file")
+  [[ "$correction_bytes" =~ ^[0-9]+$ ]] || die "could not determine retry task size" 1
+  (( correction_bytes > 0 && correction_bytes <= 50000 )) \
+    || die "retry task must contain between 1 and 50000 bytes" 1
+
+  if [[ -e "$logfile" || -L "$logfile" ]]; then
+    die "retry log already exists: $logfile" 1
+  fi
+  if [[ -e "$execution_file" || -L "$execution_file" ]]; then
+    die "retry execution package already exists: $execution_file" 1
+  fi
+
+  local count schema_value version_value task_value base_value
+  local sha_value count_value status_value actual_sha actual_count
+
+  count=$(json_field_count "$prepared" schema)
+  [[ "$count" == "1" ]] || die "PREPARED.json must contain exactly one schema field" 1
+  schema_value=$(json_string_value "$prepared" schema)
+  [[ "$schema_value" == "dual-engine-retry.v1" ]] \
+    || die "PREPARED.json has an invalid schema" 1
+
+  count=$(json_field_count "$prepared" version)
+  [[ "$count" == "1" ]] || die "PREPARED.json must contain exactly one version field" 1
+  version_value=$(json_string_value "$prepared" version)
+  [[ "$version_value" == "0.2.0" ]] || die "PREPARED.json has an invalid version" 1
+
+  count=$(json_field_count "$prepared" task_id)
+  [[ "$count" == "1" ]] || die "PREPARED.json must contain exactly one task_id field" 1
+  task_value=$(json_string_value "$prepared" task_id)
+  [[ "$task_value" == "$task_id" ]] || die "PREPARED.json task_id does not match" 1
+
+  count=$(json_field_count "$prepared" base_commit)
+  [[ "$count" == "1" ]] || die "PREPARED.json must contain exactly one base_commit field" 1
+  base_value=$(json_string_value "$prepared" base_commit)
+  [[ "$base_value" == "$worktree_head" ]] \
+    || die "PREPARED.json base_commit does not match the worktree HEAD" 1
+
+  count=$(json_field_count "$prepared" patch_sha256)
+  [[ "$count" == "1" ]] || die "PREPARED.json must contain exactly one patch_sha256 field" 1
+  sha_value=$(json_string_value "$prepared" patch_sha256)
+  [[ "$sha_value" =~ ^[0-9a-fA-F]{64}$ ]] || die "PREPARED.json patch_sha256 is invalid" 1
+
+  count=$(json_field_count "$prepared" changed_file_count)
+  [[ "$count" == "1" ]] || die "PREPARED.json must contain exactly one changed_file_count field" 1
+  count_value=$(json_int_value "$prepared" changed_file_count)
+  [[ "$count_value" =~ ^[0-9]+$ ]] || die "PREPARED.json changed_file_count is invalid" 1
+
+  count=$(json_field_count "$prepared" status)
+  [[ "$count" == "1" ]] || die "PREPARED.json must contain exactly one status field" 1
+  status_value=$(json_string_value "$prepared" status)
+  [[ "$status_value" == "PREPARED" ]] || die "PREPARED.json status is not PREPARED" 1
+
+  actual_sha=$(shasum -a 256 "$patch" | awk '{print $1}') \
+    || die "failed to compute before.patch SHA-256" 1
+  [[ "$actual_sha" =~ ^[0-9a-fA-F]{64}$ ]] || die "failed to compute before.patch SHA-256" 1
+  actual_sha=$(printf '%s' "$actual_sha" | tr '[:upper:]' '[:lower:]')
+  sha_value=$(printf '%s' "$sha_value" | tr '[:upper:]' '[:lower:]')
+  [[ "$actual_sha" == "$sha_value" ]] \
+    || die "before.patch SHA does not match PREPARED metadata" 1
+
+  actual_count=$(wc -l < "$files" | tr -d ' ')
+  [[ "$actual_count" =~ ^[0-9]+$ ]] || die "failed to count before-files.txt" 1
+  [[ "$actual_count" == "$count_value" ]] \
+    || die "before-files.txt line count does not match PREPARED metadata" 1
+
+  umask 077
+  retry_validation_tmp=$(mktemp -d "$retry_dir/.execute-validate.XXXXXX") \
+    || die "failed to create temporary validation directory" 1
+  chmod 700 "$retry_validation_tmp"
+  trap cleanup_retry_validation EXIT
+
+  local tracked_paths="$retry_validation_tmp/.tracked-paths"
+  local untracked_paths="$retry_validation_tmp/.untracked-paths"
+  local unsorted_files="$retry_validation_tmp/.before-files.unsorted"
+  local current_patch="$retry_validation_tmp/current.patch"
+  local current_files="$retry_validation_tmp/current-files.txt"
+
+  git -c core.quotePath=false -C "$worktree" diff --name-only -z HEAD -- > "$tracked_paths" \
+    || die "failed to enumerate tracked changes" 1
+  git -c core.quotePath=false -C "$worktree" ls-files --others --exclude-standard -z > "$untracked_paths" \
+    || die "failed to enumerate untracked changes" 1
+  git -C "$worktree" diff --binary --no-ext-diff --find-renames HEAD -- > "$current_patch" \
+    || die "failed to snapshot tracked changes" 1
+  : > "$unsorted_files"
+
+  local rel diff_rc
+  while IFS= read -r -d '' rel; do
+    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+      || die "changed path cannot be represented safely" 1
+    printf '%s\n' "$rel" >> "$unsorted_files"
+  done < "$tracked_paths"
+
+  while IFS= read -r -d '' rel; do
+    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+      || die "changed path cannot be represented safely" 1
+    [[ -f "$worktree/$rel" || -L "$worktree/$rel" ]] \
+      || die "unsupported untracked file type: $rel" 1
+    printf '%s\n' "$rel" >> "$unsorted_files"
+    if git -c core.quotePath=false -C "$worktree" diff --no-index --binary --no-ext-diff -- /dev/null "$rel" \
+      >> "$current_patch" 2>/dev/null; then
+      :
+    else
+      diff_rc=$?
+      [[ "$diff_rc" == "1" ]] || die "failed to snapshot untracked file: $rel" 1
+    fi
+  done < "$untracked_paths"
+
+  LC_ALL=C sort -u "$unsorted_files" > "$current_files" \
+    || die "failed to normalize changed-file list" 1
+  chmod 600 "$tracked_paths" "$untracked_paths" "$unsorted_files" "$current_patch" "$current_files"
+
+  cmp -s "$current_patch" "$patch" \
+    || die "current worktree snapshot does not match before.patch" 1
+  cmp -s "$current_files" "$files" \
+    || die "current normalized file list does not match before-files.txt" 1
+
+  local input_file="$retry_validation_tmp/input.txt"
+  cat "$task_file" > "$input_file" || die "failed to build runner input" 1
+  cat >>"$input_file" <<'EOF'
+
+--- RETRY INPUT DELIMITER ---
+Change only the reviewed delta.
+Do not explore unrelated files or history.
+Run only validation that is directly relevant to the change.
+Emit the following contract exactly once as your final answer, then stop:
+
+RETRY_RESPONSE_V1
+STATUS: COMPLETE|BLOCKED
+FILES: comma-separated repository-relative paths or NONE
+VALIDATION: concise commands and results or NOT_RUN
+SUMMARY: one concise line
+END_RETRY_RESPONSE
+EOF
+  chmod 600 "$input_file"
+
+  local max_runtime_seconds="${CODEX_DUAL_ENGINE_LITE_RETRY_MAX_RUNTIME_SECONDS:-300}"
+  local max_log_bytes="${CODEX_DUAL_ENGINE_LITE_RETRY_MAX_LOG_BYTES:-524288}"
+  [[ "$max_runtime_seconds" =~ ^[0-9]+$ ]] \
+    || die "CODEX_DUAL_ENGINE_LITE_RETRY_MAX_RUNTIME_SECONDS must be an integer" 1
+  (( max_runtime_seconds >= 1 && max_runtime_seconds <= 3600 )) \
+    || die "CODEX_DUAL_ENGINE_LITE_RETRY_MAX_RUNTIME_SECONDS must be between 1 and 3600" 1
+  [[ "$max_log_bytes" =~ ^[0-9]+$ ]] \
+    || die "CODEX_DUAL_ENGINE_LITE_RETRY_MAX_LOG_BYTES must be an integer" 1
+  (( max_log_bytes >= 1024 && max_log_bytes <= 10000000 )) \
+    || die "CODEX_DUAL_ENGINE_LITE_RETRY_MAX_LOG_BYTES must be between 1024 and 10000000" 1
+
+  local runner script_dir
+  if [[ -n "${CODEX_DUAL_ENGINE_LITE_CODEX_DS:-}" ]]; then
+    runner="${CODEX_DUAL_ENGINE_LITE_CODEX_DS}"
+    if [[ "$runner" == */* ]]; then
+      script_dir=$(cd -P "$(dirname "$runner")" && pwd -P) || die "invalid runner path" 1
+      runner="$script_dir/$(basename "$runner")"
+    fi
+  else
+    script_dir=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P) \
+      || die "failed to locate the retry runner" 1
+    runner="$script_dir/codex-ds"
+  fi
+  [[ -f "$runner" && -x "$runner" && ! -L "$runner" ]] \
+    || die "retry runner is missing or unsafe: $runner" 1
+
+  : > "$logfile" || die "failed to create retry log" 1
+  chmod 600 "$logfile"
+
+  local started_at finished_at start_epoch current_epoch elapsed_seconds
+  local current_log_bytes final_log_bytes budget_stop_reason="process_exit" budget_exceeded="false"
+  local runner_rc=0 runner_pid=""
+
+  started_at=$(TZ=UTC date '+%Y-%m-%dT%H:%M:%SZ')
+  start_epoch=$(date +%s)
+  export CODEX_DUAL_ENGINE_LITE_TASK_ID="$task_id"
+
+  set -m
+  (
+    cd "$worktree" || exit 1
+    exec "$runner" < "$input_file"
+  ) >>"$logfile" 2>&1 &
+  runner_pid=$!
+  set +m
+
+  while kill -0 "$runner_pid" 2>/dev/null; do
+    sleep 1
+    current_epoch=$(date +%s)
+    elapsed_seconds=$((current_epoch - start_epoch))
+    current_log_bytes=$(file_size "$logfile")
+
+    if (( max_runtime_seconds > 0 && elapsed_seconds >= max_runtime_seconds )); then
+      budget_stop_reason="runtime_limit_exceeded"
+    elif (( max_log_bytes > 0 && current_log_bytes >= max_log_bytes )); then
+      budget_stop_reason="log_size_limit_exceeded"
+    fi
+
+    if [[ -n "$budget_stop_reason" ]]; then
+      kill -TERM -- "-$runner_pid" 2>/dev/null || kill -TERM "$runner_pid" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        kill -0 "$runner_pid" 2>/dev/null || break
+        sleep 1
+      done
+      if kill -0 "$runner_pid" 2>/dev/null; then
+        kill -KILL -- "-$runner_pid" 2>/dev/null || kill -KILL "$runner_pid" 2>/dev/null || true
+      fi
+      break
+    fi
+  done
+
+  if wait "$runner_pid"; then
+    runner_rc=0
+  else
+    runner_rc=$?
+  fi
+
+  finished_at=$(TZ=UTC date '+%Y-%m-%dT%H:%M:%SZ')
+  final_log_bytes=$(file_size "$logfile")
+  chmod 600 "$logfile"
+
+  if [[ "$budget_stop_reason" != "process_exit" ]]; then
+    budget_exceeded="true"
+  fi
+
+  local status
+  if [[ "$runner_rc" == "0" && "$budget_exceeded" == "false" ]]; then
+    status="COMPLETE"
+  else
+    status="FAILED"
+  fi
+
+  local execution_tmp="$retry_validation_tmp/EXECUTION.json"
+  {
+    printf '{\n'
+    printf '  "schema": "dual-engine-retry-execution.v1",\n'
+    printf '  "version": "%s",\n' "$(json_escape "$VERSION")"
+    printf '  "task_id": "%s",\n' "$(json_escape "$task_id")"
+    printf '  "runner_exit_status": %s,\n' "$runner_rc"
+    printf '  "budget_exceeded": %s,\n' "$budget_exceeded"
+    printf '  "stop_reason": "%s",\n' "$(json_escape "$budget_stop_reason")"
+    printf '  "started_at": "%s",\n' "$(json_escape "$started_at")"
+    printf '  "finished_at": "%s",\n' "$(json_escape "$finished_at")"
+    printf '  "log_bytes": %s,\n' "$final_log_bytes"
+    printf '  "status": "%s"\n' "$(json_escape "$status")"
+    printf '}\n'
+  } > "$execution_tmp" || die "failed to write execution package" 1
+  chmod 600 "$execution_tmp"
+  mv -- "$execution_tmp" "$execution_file" || die "failed to publish execution package" 1
+
+  rm -rf -- "$retry_validation_tmp"
+  retry_validation_tmp=""
+  trap - EXIT
+
+  info "retry execution finished for $task_id"
+  exit 0
+}
+
 usage() {
   cat >&2 <<'EOF'
 usage: deepseek-worker-retry prepare TASK_ID --task-file FILE
+       deepseek-worker-retry execute TASK_ID
 
 Prepares one immutable retry snapshot for a reviewed worker task. The task's
 SOL_REVIEW.md must contain exactly one RETRY verdict, and the correction file
 must be non-empty and at most 50000 bytes. Nothing is merged, applied, or
-invoked; the task worktree and source repository are not modified.
+invoked during prepare. The execute subcommand runs exactly one bounded retry
+from the prepared attempt and records a reviewable execution package.
 
 options:
   -h, --help          show this help
@@ -98,8 +396,12 @@ for arg in "$@"; do
   esac
 done
 
-[[ $# -ge 1 ]] || die "expected 'prepare TASK_ID --task-file FILE'" 2
-[[ "$1" == "prepare" ]] || die "expected subcommand 'prepare'" 2
+[[ $# -ge 1 ]] || die "expected 'prepare TASK_ID --task-file FILE' or 'execute TASK_ID'" 2
+subcommand="$1"
+case "$subcommand" in
+  prepare|execute) ;;
+  *) die "expected subcommand 'prepare' or 'execute'" 2 ;;
+esac
 shift
 
 task_id=""
@@ -130,13 +432,17 @@ done
 
 [[ -n "$task_id" ]] || die "missing task id" 2
 valid_task_id "$task_id" || die "invalid task id: $task_id" 2
-[[ -n "$task_file" ]] || die "missing --task-file FILE" 2
+if [[ "$subcommand" == "prepare" ]]; then
+  [[ -n "$task_file" ]] || die "missing --task-file FILE" 2
 
-[[ -f "$task_file" && ! -L "$task_file" ]] || die "task file not found or is a symlink: $task_file" 2
-task_bytes=$(file_size "$task_file")
-[[ "$task_bytes" =~ ^[0-9]+$ ]] || die "could not determine task file size" 2
-((task_bytes > 0)) || die "task file is empty" 2
-((task_bytes <= 50000)) || die "task file exceeds the 50000 byte safety limit" 2
+  [[ -f "$task_file" && ! -L "$task_file" ]] || die "task file not found or is a symlink: $task_file" 2
+  task_bytes=$(file_size "$task_file")
+  [[ "$task_bytes" =~ ^[0-9]+$ ]] || die "could not determine task file size" 2
+  ((task_bytes > 0)) || die "task file is empty" 2
+  ((task_bytes <= 50000)) || die "task file exceeds the 50000 byte safety limit" 2
+else
+  [[ -z "$task_file" ]] || die "--task-file is only valid with prepare" 2
+fi
 
 data="$(data_home)"
 [[ "$data" == /* ]] || die "data directory must be an absolute path: $data" 1
@@ -227,27 +533,33 @@ if ! repo_status=$(git -C "$repo_root" status --porcelain 2>/dev/null); then
 fi
 [[ -z "$repo_status" ]] || die "source repository is not clean" 1
 
-# --- review verdict validation --------------------------------------------
+if [[ "$subcommand" == "prepare" ]]; then
+  # --- review verdict validation --------------------------------------------
 
-[[ -f "$review_file" && ! -L "$review_file" ]] \
-  || die "SOL_REVIEW.md is missing or unsafe: $review_file" 1
+  [[ -f "$review_file" && ! -L "$review_file" ]] \
+    || die "SOL_REVIEW.md is missing or unsafe: $review_file" 1
 
-verdict_count=$(grep -c -E -i '^[[:space:]]*verdict[[:space:]]*:' "$review_file" 2>/dev/null || true)
-[[ "$verdict_count" =~ ^[0-9]+$ ]] || die "could not parse SOL_REVIEW.md" 1
-[[ "$verdict_count" == "1" ]] \
-  || die "SOL_REVIEW.md must contain exactly one verdict (found ${verdict_count:-0})" 1
-grep -qxF 'verdict: RETRY' "$review_file" \
-  || die "SOL_REVIEW.md must contain exactly the canonical RETRY verdict" 1
+  verdict_count=$(grep -c -E -i '^[[:space:]]*verdict[[:space:]]*:' "$review_file" 2>/dev/null || true)
+  [[ "$verdict_count" =~ ^[0-9]+$ ]] || die "could not parse SOL_REVIEW.md" 1
+  [[ "$verdict_count" == "1" ]] \
+    || die "SOL_REVIEW.md must contain exactly one verdict (found ${verdict_count:-0})" 1
+  grep -qxF 'verdict: RETRY' "$review_file" \
+    || die "SOL_REVIEW.md must contain exactly the canonical RETRY verdict" 1
 
-# --- single-attempt gate ---------------------------------------------------
+  # --- single-attempt gate ---------------------------------------------------
 
-if [[ -e "$attempt_dir" || -L "$attempt_dir" ]]; then
-  die "retry attempt already exists: $attempt_dir" 1
+  if [[ -e "$attempt_dir" || -L "$attempt_dir" ]]; then
+    die "retry attempt already exists: $attempt_dir" 1
+  fi
+  if [[ -e "$retry_dir" && ! -d "$retry_dir" ]]; then
+    die "retry path is not a directory: $retry_dir" 1
+  fi
+  [[ ! -L "$retry_dir" ]] || die "refusing symlinked retry directory: $retry_dir" 1
 fi
-if [[ -e "$retry_dir" && ! -d "$retry_dir" ]]; then
-  die "retry path is not a directory: $retry_dir" 1
+
+if [[ "$subcommand" == "execute" ]]; then
+  execute_retry_run
 fi
-[[ ! -L "$retry_dir" ]] || die "refusing symlinked retry directory: $retry_dir" 1
 
 # --- build the snapshot atomically ----------------------------------------
 
