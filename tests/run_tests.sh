@@ -178,6 +178,66 @@ run_review() {
     "$REPO_ROOT/bin/deepseek-worker-review" "$@"
 }
 
+clone_review_task() {
+  local src_id="$1" dst_id="$2" src dst
+  case "$dst_id" in
+    *..*|*/*) printf 'fatal: unsafe review clone id\n' >&2; exit 1 ;;
+  esac
+  src="$TEST_DATA/tasks/$src_id"
+  dst="$TEST_DATA/tasks/$dst_id"
+  [[ -d "$src" && -d "$src/result" ]] || {
+    printf 'fatal: missing review clone source\n' >&2
+    exit 1
+  }
+  mkdir -p "$dst"
+  sed "s/^task_id=.*/task_id=$dst_id/" "$src/.managed" > "$dst/.managed"
+  cp -R "$src/result" "$dst/result"
+}
+
+set_top_level_number() {
+  local packet="$1" key="$2" value="$3" out="$TEST_TMP/review-packet.mut"
+  awk -v key="$key" -v value="$value" '
+    {
+      pattern="  \"" key "\":"
+      if (index($0, pattern) == 1) {
+        print "  \"" key "\": " value ","
+        next
+      }
+      print
+    }
+  ' "$packet" > "$out"
+  mv "$out" "$packet"
+}
+
+set_budget_exceeded_true() {
+  local packet="$1" out="$TEST_TMP/review-packet.mut"
+  awk '
+    /"exceeded":/ {
+      print "    \"exceeded\": true,"
+      next
+    }
+    { print }
+  ' "$packet" > "$out"
+  mv "$out" "$packet"
+}
+
+duplicate_schema_packet() {
+  local packet="$1" out="$TEST_TMP/review-packet.mut"
+  awk '
+    /^  "reviewer_validation":/ {
+      print "  \"reviewer_validation\": \"NOT_RUN_BY_REVIEWER\","
+      next
+    }
+    /^}/ {
+      print "  \"schema\": \"dual-engine-review.v1\""
+      print
+      next
+    }
+    { print }
+  ' "$packet" > "$out"
+  mv "$out" "$packet"
+}
+
 run_clean() {
   env HOME="$TEST_HOME" CODEX_DUAL_ENGINE_LITE_HOME="$TEST_DATA" \
     "$REPO_ROOT/bin/deepseek-worker-clean" "$@"
@@ -433,6 +493,110 @@ test_review() {
   assert_eq "review does not merge or change HEAD" "$head_before" "$head_after"
 }
 
+# --- 7b. fail-closed PASS gate -------------------------------------------
+
+test_review_pass_gate() {
+  local repo
+  repo=$(new_repo pass-gate)
+  reset_stub
+  run_worker "$repo" "do work for pass gate"
+  assert_eq "worker run for pass gate succeeds" 0 "$WORKER_RC"
+  local base_task="$WORKER_STDOUT"
+
+  local id result_dir
+
+  id="pass-positive"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  run_review "$id" PASS "positive" >/dev/null 2>&1
+  assert_eq "PASS succeeds for internally consistent package" 0 "$?"
+  assert "positive PASS writes SOL_REVIEW.md" test -f "$result_dir/SOL_REVIEW.md"
+  assert_contains "positive PASS records verdict" "$(cat "$result_dir/SOL_REVIEW.md")" "verdict: PASS"
+
+  id="pass-nonzero-status"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  set_top_level_number "$result_dir/REVIEW_PACKET.json" "model_exit_status" 7
+  run_review "$id" PASS >/dev/null 2>&1
+  assert_eq "nonzero model_exit_status blocks PASS" 1 "$?"
+  assert "nonzero PASS writes no SOL_REVIEW.md" test ! -f "$result_dir/SOL_REVIEW.md"
+  run_review "$id" RETRY >/dev/null 2>&1
+  assert_eq "RETRY records for failed task" 0 "$?"
+  assert_contains "RETRY records verdict" "$(cat "$result_dir/SOL_REVIEW.md")" "verdict: RETRY"
+  run_review "$id" TAKEOVER >/dev/null 2>&1
+  assert_eq "TAKEOVER records for failed task" 0 "$?"
+  assert_contains "TAKEOVER records verdict" "$(cat "$result_dir/SOL_REVIEW.md")" "verdict: TAKEOVER"
+
+  id="pass-budget-exceeded"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  set_budget_exceeded_true "$result_dir/REVIEW_PACKET.json"
+  run_review "$id" PASS >/dev/null 2>&1
+  assert_eq "budget_exceeded true blocks PASS" 1 "$?"
+  assert "budget-exceeded PASS writes no SOL_REVIEW.md" test ! -f "$result_dir/SOL_REVIEW.md"
+
+  id="pass-bad-sha"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  printf 'tampered patch\n' >> "$result_dir/diff.patch"
+  run_review "$id" PASS >/dev/null 2>&1
+  assert_eq "tampered diff.patch hash blocks PASS" 1 "$?"
+  assert "tampered-hash PASS writes no SOL_REVIEW.md" test ! -f "$result_dir/SOL_REVIEW.md"
+
+  id="pass-bad-count"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  set_top_level_number "$result_dir/REVIEW_PACKET.json" "changed_file_count" 999
+  run_review "$id" PASS >/dev/null 2>&1
+  assert_eq "mismatched changed_file_count blocks PASS" 1 "$?"
+  assert "mismatched-count PASS writes no SOL_REVIEW.md" test ! -f "$result_dir/SOL_REVIEW.md"
+
+  id="pass-missing-packet"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  mv "$result_dir/REVIEW_PACKET.json" "$TEST_TMP/pass-missing-packet.json"
+  run_review "$id" PASS >/dev/null 2>&1
+  assert_eq "missing REVIEW_PACKET.json blocks PASS" 1 "$?"
+  assert "missing-packet PASS writes no SOL_REVIEW.md" test ! -f "$result_dir/SOL_REVIEW.md"
+
+  id="pass-malformed"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  printf '%s\n' '{"schema":"dual-engine-review.v1","model_exit_status":0,}' > "$result_dir/REVIEW_PACKET.json"
+  run_review "$id" PASS >/dev/null 2>&1
+  assert_eq "malformed review packet blocks PASS" 1 "$?"
+  assert "malformed-packet PASS writes no SOL_REVIEW.md" test ! -f "$result_dir/SOL_REVIEW.md"
+
+  id="pass-duplicate"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  duplicate_schema_packet "$result_dir/REVIEW_PACKET.json"
+  run_review "$id" PASS >/dev/null 2>&1
+  assert_eq "duplicate required field blocks PASS" 1 "$?"
+  assert "duplicate-field PASS writes no SOL_REVIEW.md" test ! -f "$result_dir/SOL_REVIEW.md"
+
+  id="pass-symlink-artifact"
+  clone_review_task "$base_task" "$id"
+  result_dir="$TEST_DATA/tasks/$id/result"
+  mv "$result_dir/task.txt" "$TEST_TMP/pass-real-task.txt"
+  ln -s "$TEST_TMP/pass-real-task.txt" "$result_dir/task.txt"
+  run_review "$id" PASS >/dev/null 2>&1
+  assert_eq "symlinked required artifact blocks PASS" 1 "$?"
+  assert "symlink-artifact PASS writes no SOL_REVIEW.md" test ! -f "$result_dir/SOL_REVIEW.md"
+
+  local dirty_repo dirty_task dirty_result
+  dirty_repo=$(new_repo pass-dirty)
+  reset_stub
+  run_worker "$dirty_repo" "do work then dirty main repo"
+  assert_eq "worker run for dirty PASS case succeeds" 0 "$WORKER_RC"
+  dirty_task="$WORKER_STDOUT"
+  dirty_result="$TEST_DATA/tasks/$dirty_task/result"
+  printf 'uncommitted after review package\n' >> "$dirty_repo/src/hello.txt"
+  run_review "$dirty_task" PASS >/dev/null 2>&1
+  assert_eq "dirty source repository blocks PASS" 1 "$?"
+  assert "dirty-repo PASS writes no SOL_REVIEW.md" test ! -f "$dirty_result/SOL_REVIEW.md"
+}
+
 # --- 8. cleanup validation and preservation ------------------------------
 
 test_clean() {
@@ -620,6 +784,7 @@ test_placeholders_not_blocked
 test_dirty_repo_rejected
 test_model_failure_distinguished
 test_review
+test_review_pass_gate
 test_clean
 test_install_uninstall
 test_codex_ds

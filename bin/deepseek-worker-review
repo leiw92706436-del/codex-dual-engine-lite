@@ -2,9 +2,9 @@
 # Codex Dual Engine Lite - review gate recorder (macOS v0.2.0)
 #
 # Records an independent human/Sol verdict for an exact task id. This is a
-# recorder, not a fake reviewer: it validates inputs and writes SOL_REVIEW.md
-# atomically without printing sensitive task logs and without merging or
-# applying anything.
+# recorder, not a fake reviewer: it validates inputs, enforces a fail-closed
+# PASS gate, and writes SOL_REVIEW.md atomically without printing sensitive
+# task logs and without merging or applying anything.
 
 set -euo pipefail
 shopt -s extglob 2>/dev/null || true
@@ -42,6 +42,219 @@ is_within() {
     "$rb"|"$rb"/*) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+require_artifact() {
+  local dir rel path
+  dir="$1"
+  rel="$2"
+  path="$dir/$rel"
+  [[ -f "$path" && ! -L "$path" ]] || die "required result artifact missing or unsafe: $rel" 1
+}
+
+marker_field() {
+  local key="$1" value count
+  count=$(grep -c "^$key=" "$marker" 2>/dev/null || true)
+  [[ "$count" == "1" ]] || die "managed marker has missing, duplicate, or ambiguous field: $key" 1
+  value=$(sed -n "s/^$key=//p" "$marker")
+  [[ -n "$value" ]] || die "managed marker has empty field: $key" 1
+  printf '%s\n' "$value"
+}
+
+review_packet_parse() {
+  local packet="$1" output line
+  output=$(awk '
+    function fail(msg) { invalid=1; exit 1 }
+    function valid_number(s) {
+      if (s ~ /^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$/) return 1
+      return 0
+    }
+    function set_req(path, t, v) {
+      if (path=="schema") { req["schema_type"]=t; req["schema"]=v }
+      else if (path=="model_exit_status") { req["model_type"]=t; req["model"]=v }
+      else if (path=="budget.exceeded") { req["budget_type"]=t; req["budget"]=v }
+      else if (path=="main_worktree_clean_after") { req["main_type"]=t; req["main"]=v }
+      else if (path=="patch_sha256") { req["sha_type"]=t; req["sha"]=v }
+      else if (path=="changed_file_count") { req["count_type"]=t; req["count"]=v }
+    }
+    function parse_scalar(path,   t, v) {
+      t=types[i]; v=tokens[i]
+      if (t=="string" || t=="number" || t=="true" || t=="false" || t=="null") {
+        last_type=t; last_val=v; i++
+      } else fail("expected scalar")
+      set_req(path, t, v)
+    }
+    function parse_value(path,   t) {
+      t=types[i]
+      if (t=="{") parse_object(path)
+      else if (t=="[") fail("array unsupported")
+      else parse_scalar(path)
+    }
+    function parse_object(path,   key, childpath, t) {
+      if (types[i] != "{") fail("expected object")
+      i++
+      if (types[i] == "}") { i++; return }
+      while (1) {
+        if (types[i] != "string") fail("expected key")
+        key=tokens[i]; i++
+        if (key in seen) fail("duplicate key")
+        seen[key]=1
+        if (types[i] != ":") fail("expected colon")
+        i++
+        childpath=(path=="" ? key : path "." key)
+        parse_value(childpath)
+        t=types[i]
+        if (t==",") { i++; continue }
+        else if (t=="}") { i++; return }
+        else fail("expected comma or close")
+      }
+    }
+    BEGIN { n=0; i=0; invalid=0 }
+    {
+      line=$0
+      for (p=1; p<=length(line); p++) {
+        c=substr(line,p,1)
+        if (c==" " || c=="\t" || c=="\r" || c=="\n") continue
+        if (c=="\"") {
+          out=""; q=p+1; ok=0
+          while (q<=length(line)) {
+            ch=substr(line,q,1)
+            if (ch=="\"") { ok=1; break }
+            if (ch=="\\") {
+              q++
+              if (q>length(line)) fail("unterminated escape")
+              esc=substr(line,q,1)
+              if (esc=="\"" || esc=="\\" || esc=="/") out=out esc
+              else fail("ambiguous escape")
+            } else if (ch < " ") fail("control char")
+            else out=out ch
+            q++
+          }
+          if (!ok) fail("unterminated string")
+          p=q
+          n++; types[n]="string"; tokens[n]=out
+          continue
+        }
+        if (c=="{" || c=="}" || c=="[" || c=="]" || c==":" || c==",") {
+          n++; types[n]=c; tokens[n]=c
+          continue
+        }
+        if (c=="-" || (c>="0" && c<="9")) {
+          start=p; q=p
+          while (q<=length(line)) {
+            ch=substr(line,q,1)
+            if (ch ~ /[0-9eE+\-.]/) q++
+            else break
+          }
+          tok=substr(line,start,q-start)
+          if (!valid_number(tok)) fail("bad number")
+          p=q-1
+          n++; types[n]="number"; tokens[n]=tok
+          continue
+        }
+        if (c=="t" || c=="f" || c=="n") {
+          q=p
+          while (q<=length(line) && substr(line,q,1) ~ /[A-Za-z]/) q++
+          tok=substr(line,p,q-p)
+          if (tok=="true" || tok=="false" || tok=="null") {
+            n++; types[n]=tok; tokens[n]=tok
+            p=q-1
+            continue
+          }
+          fail("bad literal")
+        }
+        fail("unexpected character")
+      }
+    }
+    END {
+      if (invalid) exit 1
+      i=1
+      parse_value("")
+      if (i != n+1) fail("trailing tokens")
+      if (invalid) exit 1
+      printf "schema_type=%s\n", req["schema_type"]
+      printf "schema=%s\n", req["schema"]
+      printf "model_type=%s\n", req["model_type"]
+      printf "model=%s\n", req["model"]
+      printf "budget_type=%s\n", req["budget_type"]
+      printf "budget=%s\n", req["budget"]
+      printf "main_type=%s\n", req["main_type"]
+      printf "main=%s\n", req["main"]
+      printf "sha_type=%s\n", req["sha_type"]
+      printf "sha=%s\n", req["sha"]
+      printf "count_type=%s\n", req["count_type"]
+      printf "count=%s\n", req["count"]
+    }
+  ' "$packet") || die "REVIEW_PACKET.json is malformed or ambiguous" 1
+
+  rp_schema_type=""
+  rp_schema=""
+  rp_model_type=""
+  rp_model=""
+  rp_budget_type=""
+  rp_budget=""
+  rp_main_type=""
+  rp_main=""
+  rp_sha_type=""
+  rp_sha=""
+  rp_count_type=""
+  rp_count=""
+  while IFS= read -r line; do
+    case "$line" in
+      schema_type=*) rp_schema_type=${line#schema_type=} ;;
+      schema=*) rp_schema=${line#schema=} ;;
+      model_type=*) rp_model_type=${line#model_type=} ;;
+      model=*) rp_model=${line#model=} ;;
+      budget_type=*) rp_budget_type=${line#budget_type=} ;;
+      budget=*) rp_budget=${line#budget=} ;;
+      main_type=*) rp_main_type=${line#main_type=} ;;
+      main=*) rp_main=${line#main=} ;;
+      sha_type=*) rp_sha_type=${line#sha_type=} ;;
+      sha=*) rp_sha=${line#sha=} ;;
+      count_type=*) rp_count_type=${line#count_type=} ;;
+      count=*) rp_count=${line#count=} ;;
+    esac
+  done <<< "$output"
+}
+
+pass_gate_checks() {
+  local artifact actual_sha actual_count source_repo repo_status
+
+  for artifact in REVIEW_PACKET.json metadata.json diff.patch changed-files.txt task.txt TASK_RESULT.md; do
+    require_artifact "$result_dir" "$artifact"
+  done
+
+  review_packet_parse "$result_dir/REVIEW_PACKET.json"
+
+  [[ "$rp_schema_type" == "string" && "$rp_schema" == "dual-engine-review.v1" ]] \
+    || die "REVIEW_PACKET.json schema is not dual-engine-review.v1" 1
+  [[ "$rp_model_type" == "number" && "$rp_model" == "0" ]] \
+    || die "REVIEW_PACKET.json model_exit_status is not exactly 0" 1
+  [[ "$rp_budget_type" == "false" && "$rp_budget" == "false" ]] \
+    || die "REVIEW_PACKET.json budget.exceeded is not false" 1
+  [[ "$rp_main_type" == "true" && "$rp_main" == "true" ]] \
+    || die "REVIEW_PACKET.json main_worktree_clean_after is not true" 1
+  [[ "$rp_sha_type" == "string" && "$rp_sha" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "REVIEW_PACKET.json patch_sha256 is missing or malformed" 1
+  [[ "$rp_count_type" == "number" && "$rp_count" =~ ^[0-9]+$ ]] \
+    || die "REVIEW_PACKET.json changed_file_count is missing or malformed" 1
+
+  actual_sha=$(shasum -a 256 "$result_dir/diff.patch" | awk '{print $1}')
+  [[ "$actual_sha" == "$rp_sha" ]] || die "diff.patch does not match patch_sha256 in REVIEW_PACKET.json" 1
+
+  actual_count=$(grep -c -v '^[[:space:]]*$' "$result_dir/changed-files.txt" 2>/dev/null || true)
+  [[ "$actual_count" == "$rp_count" ]] \
+    || die "changed-files.txt line count does not match changed_file_count in REVIEW_PACKET.json" 1
+
+  source_repo=$(marker_field repo)
+  [[ "$source_repo" == /* ]] || die "managed marker has invalid source repository" 1
+  [[ -d "$source_repo" ]] || die "source repository no longer exists" 1
+  git -C "$source_repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "source repository is not a Git worktree" 1
+  if ! repo_status=$(git -C "$source_repo" status --porcelain 2>/dev/null); then
+    die "cannot verify source repository cleanliness" 1
+  fi
+  [[ -z "$repo_status" ]] || die "source repository is not clean" 1
 }
 
 usage() {
@@ -103,6 +316,10 @@ is_within "$result_dir" "$task_dir" || die "result path escapes task directory" 
 # Confirm the marker belongs to this exact task id.
 if ! grep -qxF "task_id=$task_id" "$marker"; then
   die "managed marker does not match task id: $task_id" 1
+fi
+
+if [[ "$verdict" == "PASS" ]]; then
+  pass_gate_checks
 fi
 
 recorded_at=$(date '+%Y-%m-%dT%H:%M:%S%z')

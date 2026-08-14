@@ -141,6 +141,10 @@ The product is only safe if an independent party reviews results.
 Mitigations:
 
 - Review recording is a separate command with an explicit verdict.
+- A PASS verdict is not based on the delegated model's self-assessment: it
+  locally recomputes structural and safety invariants from the result package.
 - The tool does not claim to perform automatic Sol reasoning or merging.
 
-Residual risk: the tool cannot verify that a human actually read the diff.
+Residual risk: the locally computed structural and safety checks do not
+establish semantic code correctness, and independent human/Sol review remains
+required; the tool cannot verify that a human actually read the diff.

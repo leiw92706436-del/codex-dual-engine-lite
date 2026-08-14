@@ -29,7 +29,9 @@ It does:
 - run a fail-closed secret preflight before the model sees any files;
 - invoke the model through the Codex CLI with a `workspace-write` sandbox;
 - preserve an auditable result package (diff, changed-file list, metadata, log);
-- record an independent human/Sol review verdict as a separate action;
+- record an independent human/Sol review verdict as a separate action, with a
+  fail-closed PASS gate that verifies the local result invariants before
+  recording `PASS`;
 - clean up only the managed worktree and branch while preserving results.
 
 It does **not**:
@@ -218,6 +220,8 @@ emitted.
    - `RETRY`: re-run with a refined task.
    - `TAKEOVER`: a human takes over.
 
+   `PASS` is fail-closed; see the PASS gate section below.
+
 5. Clean up the managed worktree and branch (results are preserved):
 
    ```sh
@@ -242,6 +246,29 @@ For a task id, the result directory contains:
 The model exit status and the "files changed" flag are recorded separately; a
 failed model run can still produce (or not produce) file changes, and both
 facts are preserved.
+
+### PASS gate
+
+`deepseek-worker-review TASK_ID PASS ...` refuses to record `PASS` (and does
+not create or modify `SOL_REVIEW.md`) unless all of the following hold:
+
+- `REVIEW_PACKET.json`, `metadata.json`, `diff.patch`, `changed-files.txt`,
+  `task.txt`, and `TASK_RESULT.md` exist as regular, non-symlink files in the
+  validated managed result directory.
+- `REVIEW_PACKET.json` is valid and its schema is `dual-engine-review.v1`.
+- `model_exit_status` is exactly `0`.
+- `budget.exceeded` is `false`.
+- `main_worktree_clean_after` is `true`.
+- the current SHA-256 of `diff.patch` matches `patch_sha256`.
+- the current nonblank line count of `changed-files.txt` matches
+  `changed_file_count`.
+- the source repository recorded in the managed marker still exists, is a Git
+  worktree, and is currently clean.
+
+Missing, malformed, duplicate, or ambiguous required JSON fields fail closed.
+The recorder checks these local invariants; it does not reason about whether
+the code change is correct or safe to apply. `RETRY` and `TAKEOVER` remain
+recordable for failed or incomplete tasks.
 
 ## Secret preflight
 
@@ -308,8 +335,9 @@ bash tests/run_tests.sh
 It covers script syntax, a successful isolated run, secret filename/content
 preflight, placeholder non-blocking, dirty-repository rejection, model
 exit-vs-changes distinction, review validation and traversal defense, cleanup
-validation and result preservation, complete `diff.patch` capture for tracked
-and untracked (including binary) files, and safe install/uninstall.
+validation and result preservation, fail-closed PASS-gate coverage (positive
+and negative cases), complete `diff.patch` capture for tracked and untracked
+(including binary) files, and safe install/uninstall.
 
 ## Known limitations
 
