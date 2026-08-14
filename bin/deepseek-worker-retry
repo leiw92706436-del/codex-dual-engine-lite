@@ -310,7 +310,7 @@ EOF
       budget_stop_reason="log_size_limit_exceeded"
     fi
 
-    if [[ -n "$budget_stop_reason" ]]; then
+    if [[ "$budget_stop_reason" != "process_exit" ]]; then
       kill -TERM -- "-$runner_pid" 2>/dev/null || kill -TERM "$runner_pid" 2>/dev/null || true
       for _ in 1 2 3 4 5; do
         kill -0 "$runner_pid" 2>/dev/null || break

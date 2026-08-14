@@ -89,6 +89,12 @@ task=$(cat)
   printf 'STUB_INVOKED\n'
   printf 'argv=%s\n' "$*"
   printf 'task_len=%s\n' "${#task}"
+  printf 'task_sha256=%s\n' "$(printf '%s' "$task" | shasum -a 256 | awk '{print $1}')"
+  if printf '%s' "$task" | grep -qF 'RETRY_RESPONSE_V1'; then
+    printf 'has_retry_contract=1\n'
+  else
+    printf 'has_retry_contract=0\n'
+  fi
   printf 'cwd=%s\n' "$(pwd -P)"
   printf 'task_id=%s\n' "${CODEX_DUAL_ENGINE_LITE_TASK_ID:-<unset>}"
 } >> "$log"
@@ -166,10 +172,13 @@ reset_stub() {
   CDE_STUB_BINARY=""
   CDE_STUB_OUTPUT_BYTES=""
   CDE_STUB_SLEEP_SECONDS=""
+  RETRY_RUNNER="$STUB"
   CDE_TEST_MAX_RUNTIME_SECONDS="1800"
   CDE_TEST_MAX_LOG_BYTES="2000000"
   CDE_TEST_MAX_CHANGED_FILES="100"
   CDE_TEST_MAX_PATCH_BYTES="5000000"
+  CDE_TEST_RETRY_MAX_RUNTIME_SECONDS="300"
+  CDE_TEST_RETRY_MAX_LOG_BYTES="524288"
 }
 
 run_worker() {
@@ -271,6 +280,48 @@ run_clean() {
 run_retry() {
   env HOME="$TEST_HOME" CODEX_DUAL_ENGINE_LITE_HOME="$TEST_DATA" \
     "$REPO_ROOT/bin/deepseek-worker-retry" "$@"
+}
+
+run_retry_execute() {
+  local err_file="$TEST_TMP/retry-execute-stderr"
+  RETRY_STDOUT=""
+  RETRY_ERR=""
+  RETRY_RC=0
+  RETRY_STDOUT=$(env \
+    HOME="$TEST_HOME" \
+    CODEX_DUAL_ENGINE_LITE_HOME="$TEST_DATA" \
+    CODEX_DUAL_ENGINE_LITE_CODEX_DS="${RETRY_RUNNER:-$STUB}" \
+    CDE_STUB_LOG="$STUB_LOG" \
+    CDE_STUB_EXIT="${CDE_STUB_EXIT:-}" \
+    CDE_STUB_NOCHANGE="${CDE_STUB_NOCHANGE:-}" \
+    CDE_STUB_BINARY="${CDE_STUB_BINARY:-}" \
+    CDE_STUB_OUTPUT_BYTES="${CDE_STUB_OUTPUT_BYTES:-}" \
+    CDE_STUB_SLEEP_SECONDS="${CDE_STUB_SLEEP_SECONDS:-}" \
+    CODEX_DUAL_ENGINE_LITE_RETRY_MAX_RUNTIME_SECONDS="${CDE_TEST_RETRY_MAX_RUNTIME_SECONDS:-300}" \
+    CODEX_DUAL_ENGINE_LITE_RETRY_MAX_LOG_BYTES="${CDE_TEST_RETRY_MAX_LOG_BYTES:-524288}" \
+    "$REPO_ROOT/bin/deepseek-worker-retry" execute "$@" 2>"$err_file")
+  RETRY_RC=$?
+  RETRY_ERR=$(cat "$err_file")
+}
+
+retry_contract_suffix() {
+  printf '%s' $'\n--- RETRY INPUT DELIMITER ---\nChange only the reviewed delta.\nDo not explore unrelated files or history.\nRun only validation that is directly relevant to the change.\nEmit the following contract exactly once as your final answer, then stop:\n\nRETRY_RESPONSE_V1\nSTATUS: COMPLETE|BLOCKED\nFILES: comma-separated repository-relative paths or NONE\nVALIDATION: concise commands and results or NOT_RUN\nSUMMARY: one concise line\nEND_RETRY_RESPONSE'
+}
+
+new_retry_task() {
+  local name="$1" correction="$2"
+  local repo task_id
+  repo=$(new_repo "$name")
+  reset_stub
+  CDE_STUB_BINARY=1
+  run_worker "$repo" "create a reviewable change for retry execution"
+  [[ "$WORKER_RC" == "0" ]] || { printf 'fatal: worker setup failed for retry execution\n' >&2; return 1; }
+  task_id="$WORKER_STDOUT"
+  run_review "$task_id" RETRY "one bounded correction" >/dev/null 2>&1
+  [[ $? == "0" ]] || { printf 'fatal: review setup failed for retry execution\n' >&2; return 1; }
+  run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
+  [[ $? == "0" ]] || { printf 'fatal: prepare setup failed for retry execution\n' >&2; return 1; }
+  printf '%s\n' "$task_id"
 }
 
 # --- 1. syntax ------------------------------------------------------------
@@ -804,6 +855,144 @@ test_retry_prepare() {
   assert_eq "retry preparation rejects a symlinked managed task" 1 "$?"
 }
 
+# --- 7d. controlled retry execution --------------------------------------
+
+test_retry_execute() {
+  local correction="$TEST_TMP/retry-execute-correction.txt"
+  local task_id task_dir attempt_dir worktree repo execution expected_input expected_sha
+  local stub_count_before stub_count_after head_before
+  printf 'Fix only the reviewed retry delta.' > "$correction"
+
+  task_id=$(new_retry_task retry-execute-success "$correction")
+  task_dir="$TEST_DATA/tasks/$task_id"
+  attempt_dir="$task_dir/result/retry/attempt-1"
+  worktree="$task_dir/worktree"
+  repo=$(sed -n 's/^repo=//p' "$task_dir/.managed")
+  head_before=$(git -C "$repo" rev-parse HEAD)
+  expected_input="$(cat "$correction")$(retry_contract_suffix)"
+  expected_sha=$(printf '%s' "$expected_input" | shasum -a 256 | awk '{print $1}')
+
+  reset_stub
+  CDE_STUB_SLEEP_SECONDS=2
+  CDE_TEST_RETRY_MAX_RUNTIME_SECONDS=5
+  run_retry_execute "$task_id"
+  assert_eq "retry execute succeeds within its runtime budget" 0 "$RETRY_RC"
+  assert_eq "retry execute invokes the runner exactly once" 1 \
+    "$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)"
+  assert_contains "retry runner receives the exact composed input" "$(cat "$STUB_LOG")" \
+    "task_sha256=$expected_sha"
+  assert_contains "retry runner receives the fixed response contract" "$(cat "$STUB_LOG")" \
+    "has_retry_contract=1"
+  assert_contains "retry runner executes in the managed worktree" "$(cat "$STUB_LOG")" \
+    "cwd=$(cd -P "$worktree" && pwd -P)"
+  assert_contains "retry runner receives the managed task id" "$(cat "$STUB_LOG")" \
+    "task_id=$task_id"
+  assert "retry execution writes a private log" test -f "$attempt_dir/retry.log"
+  assert "retry execution writes a reviewable package" test -f "$attempt_dir/EXECUTION.json"
+  assert_eq "retry log is mode 0600" 600 "$(perm_octal "$attempt_dir/retry.log")"
+  assert_eq "retry execution package is mode 0600" 600 "$(perm_octal "$attempt_dir/EXECUTION.json")"
+  execution=$(cat "$attempt_dir/EXECUTION.json")
+  assert_contains "retry execution package uses v1 schema" "$execution" \
+    '"schema": "dual-engine-retry-execution.v1"'
+  assert_contains "retry execution package records COMPLETE" "$execution" '"status": "COMPLETE"'
+  assert_contains "retry execution package records runner exit zero" "$execution" '"runner_exit_status": 0'
+  assert_contains "retry execution package records normal process exit" "$execution" \
+    '"stop_reason": "process_exit"'
+  assert_contains "retry execution package records no budget breach" "$execution" \
+    '"budget_exceeded": false'
+  assert_eq "retry execution leaves source HEAD unchanged" "$head_before" "$(git -C "$repo" rev-parse HEAD)"
+  assert_eq "retry execution leaves source repository clean" "" "$(git -C "$repo" status --porcelain)"
+
+  stub_count_before=$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)
+  run_retry_execute "$task_id"
+  assert_eq "a second retry execution is refused" 1 "$RETRY_RC"
+  stub_count_after=$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)
+  assert_eq "second retry refusal does not invoke the runner" "$stub_count_before" "$stub_count_after"
+  run_retry_execute "$task_id" --task-file "$correction"
+  assert_eq "execute rejects --task-file" 2 "$RETRY_RC"
+  assert_eq "invalid execute options do not invoke the runner" "$stub_count_after" \
+    "$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)"
+
+  task_id=$(new_retry_task retry-execute-tampered-patch "$correction")
+  attempt_dir="$TEST_DATA/tasks/$task_id/result/retry/attempt-1"
+  printf 'tamper\n' >> "$attempt_dir/before.patch"
+  reset_stub
+  run_retry_execute "$task_id"
+  assert_eq "tampered retry snapshot is rejected" 1 "$RETRY_RC"
+  assert_eq "tampered snapshot is rejected before runner invocation" 0 \
+    "$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)"
+  assert "tampered snapshot writes no execution package" test ! -e "$attempt_dir/EXECUTION.json"
+
+  task_id=$(new_retry_task retry-execute-drift "$correction")
+  task_dir="$TEST_DATA/tasks/$task_id"
+  attempt_dir="$task_dir/result/retry/attempt-1"
+  worktree="$task_dir/worktree"
+  printf 'post-prepare drift\n' >> "$worktree/src/hello.txt"
+  reset_stub
+  run_retry_execute "$task_id"
+  assert_eq "post-prepare worktree drift is rejected" 1 "$RETRY_RC"
+  assert_eq "worktree drift is rejected before runner invocation" 0 \
+    "$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)"
+  assert "worktree drift writes no execution package" test ! -e "$attempt_dir/EXECUTION.json"
+
+  task_id=$(new_retry_task retry-execute-symlink-runner "$correction")
+  attempt_dir="$TEST_DATA/tasks/$task_id/result/retry/attempt-1"
+  rm -f -- "$TEST_TMP/retry-runner-link"
+  ln -s "$STUB" "$TEST_TMP/retry-runner-link"
+  reset_stub
+  RETRY_RUNNER="$TEST_TMP/retry-runner-link"
+  run_retry_execute "$task_id"
+  assert_eq "symlinked retry runner is rejected" 1 "$RETRY_RC"
+  assert_eq "symlinked runner is rejected before invocation" 0 \
+    "$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)"
+  assert "unsafe runner writes no execution package" test ! -e "$attempt_dir/EXECUTION.json"
+
+  task_id=$(new_retry_task retry-execute-nonzero "$correction")
+  attempt_dir="$TEST_DATA/tasks/$task_id/result/retry/attempt-1"
+  reset_stub
+  CDE_STUB_EXIT=7
+  run_retry_execute "$task_id"
+  assert_eq "nonzero retry runner still writes a reviewable package" 0 "$RETRY_RC"
+  execution=$(cat "$attempt_dir/EXECUTION.json")
+  assert_contains "nonzero retry execution records FAILED" "$execution" '"status": "FAILED"'
+  assert_contains "nonzero retry execution records exact runner exit" "$execution" \
+    '"runner_exit_status": 7'
+  assert_contains "nonzero retry execution records process exit" "$execution" \
+    '"stop_reason": "process_exit"'
+  assert_contains "nonzero retry execution is not a budget breach" "$execution" \
+    '"budget_exceeded": false'
+
+  task_id=$(new_retry_task retry-execute-runtime "$correction")
+  attempt_dir="$TEST_DATA/tasks/$task_id/result/retry/attempt-1"
+  reset_stub
+  CDE_STUB_SLEEP_SECONDS=10
+  CDE_TEST_RETRY_MAX_RUNTIME_SECONDS=1
+  run_retry_execute "$task_id"
+  assert_eq "runtime-stopped retry writes a reviewable package" 0 "$RETRY_RC"
+  execution=$(cat "$attempt_dir/EXECUTION.json")
+  assert_contains "runtime-stopped retry records FAILED" "$execution" '"status": "FAILED"'
+  assert_contains "runtime-stopped retry records its stop reason" "$execution" \
+    '"stop_reason": "runtime_limit_exceeded"'
+  assert_contains "runtime-stopped retry records budget breach" "$execution" \
+    '"budget_exceeded": true'
+
+  task_id=$(new_retry_task retry-execute-log "$correction")
+  attempt_dir="$TEST_DATA/tasks/$task_id/result/retry/attempt-1"
+  reset_stub
+  CDE_STUB_OUTPUT_BYTES=5000
+  CDE_STUB_SLEEP_SECONDS=10
+  CDE_TEST_RETRY_MAX_RUNTIME_SECONDS=30
+  CDE_TEST_RETRY_MAX_LOG_BYTES=1024
+  run_retry_execute "$task_id"
+  assert_eq "log-stopped retry writes a reviewable package" 0 "$RETRY_RC"
+  execution=$(cat "$attempt_dir/EXECUTION.json")
+  assert_contains "log-stopped retry records FAILED" "$execution" '"status": "FAILED"'
+  assert_contains "log-stopped retry records its stop reason" "$execution" \
+    '"stop_reason": "log_size_limit_exceeded"'
+  assert_contains "log-stopped retry records budget breach" "$execution" \
+    '"budget_exceeded": true'
+}
+
 # --- 8. cleanup validation and preservation ------------------------------
 
 test_clean() {
@@ -995,6 +1184,7 @@ test_model_failure_distinguished
 test_review
 test_review_pass_gate
 test_retry_prepare
+test_retry_execute
 test_clean
 test_install_uninstall
 test_codex_ds
