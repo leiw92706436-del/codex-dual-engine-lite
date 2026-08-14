@@ -268,6 +268,11 @@ run_clean() {
     "$REPO_ROOT/bin/deepseek-worker-clean" "$@"
 }
 
+run_retry() {
+  env HOME="$TEST_HOME" CODEX_DUAL_ENGINE_LITE_HOME="$TEST_DATA" \
+    "$REPO_ROOT/bin/deepseek-worker-retry" "$@"
+}
+
 # --- 1. syntax ------------------------------------------------------------
 
 test_syntax() {
@@ -665,6 +670,140 @@ test_review_pass_gate() {
   assert "dirty-repo PASS writes no SOL_REVIEW.md" test ! -f "$dirty_result/SOL_REVIEW.md"
 }
 
+# --- 7c. controlled retry preparation ------------------------------------
+
+test_retry_prepare() {
+  local repo task_id task_dir result_dir worktree review_file attempt_dir
+  local correction correction_link status_before status_after head_before head_after
+  local stub_count_before stub_count_after expected_sha actual_sha
+
+  repo=$(new_repo retry-prepare)
+  reset_stub
+  CDE_STUB_BINARY=1
+  run_worker "$repo" "create a reviewable change for retry preparation"
+  assert_eq "worker run for retry preparation succeeds" 0 "$WORKER_RC"
+
+  task_id="$WORKER_STDOUT"
+  task_dir="$TEST_DATA/tasks/$task_id"
+  result_dir="$task_dir/result"
+  worktree="$task_dir/worktree"
+  review_file="$result_dir/SOL_REVIEW.md"
+  attempt_dir="$result_dir/retry/attempt-1"
+  correction="$TEST_TMP/retry-correction.txt"
+  correction_link="$TEST_TMP/retry-correction-link.txt"
+  printf 'Fix only the reviewed delta.\nPreserve this final byte: X' > "$correction"
+
+  run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects a missing review verdict" 1 "$?"
+  assert "missing verdict leaves no attempt directory" test ! -e "$attempt_dir"
+
+  run_review "$task_id" PASS "baseline review" >/dev/null 2>&1
+  assert_eq "baseline PASS review is recorded" 0 "$?"
+  run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects a non-RETRY verdict" 1 "$?"
+
+  run_review "$task_id" RETRY "one bounded correction" >/dev/null 2>&1
+  printf 'verdict: RETRY\n' >> "$review_file"
+  run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects duplicate verdicts" 1 "$?"
+
+  run_review "$task_id" RETRY "one bounded correction" >/dev/null 2>&1
+  sed 's/^verdict:/Verdict:/' "$review_file" > "$TEST_TMP/retry-review-mutated"
+  mv "$TEST_TMP/retry-review-mutated" "$review_file"
+  run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects noncanonical ambiguous verdict spelling" 1 "$?"
+  run_review "$task_id" RETRY "one bounded correction" >/dev/null 2>&1
+
+  cp "$repo/src/hello.txt" "$TEST_TMP/retry-main-original"
+  printf 'dirty main\n' >> "$repo/src/hello.txt"
+  run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects a dirty source repository" 1 "$?"
+  cp "$TEST_TMP/retry-main-original" "$repo/src/hello.txt"
+
+  ln -s "$correction" "$correction_link"
+  run_retry prepare "$task_id" --task-file "$correction_link" >/dev/null 2>&1
+  assert_eq "retry preparation rejects a symlinked correction file" 2 "$?"
+  run_retry prepare "../evil" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects traversal task ids" 2 "$?"
+  run_retry prepare "missing-retry-task" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects a missing managed task" 1 "$?"
+
+  mkdir -p "$TEST_TMP/failing-tools"
+  printf '#!/usr/bin/env bash\nexit 9\n' > "$TEST_TMP/failing-tools/shasum"
+  chmod 700 "$TEST_TMP/failing-tools/shasum"
+  env HOME="$TEST_HOME" CODEX_DUAL_ENGINE_LITE_HOME="$TEST_DATA" \
+    PATH="$TEST_TMP/failing-tools:$PATH" \
+    "$REPO_ROOT/bin/deepseek-worker-retry" prepare "$task_id" --task-file "$correction" \
+    >/dev/null 2>&1
+  assert_eq "snapshot failure is reported" 1 "$?"
+  assert "snapshot failure leaves no published attempt" test ! -e "$attempt_dir"
+  assert_eq "snapshot failure cleans temporary attempt directories" "" \
+    "$(find "$result_dir/retry" -maxdepth 1 -name '.attempt-1.*' -print 2>/dev/null)"
+
+  git -C "$worktree" add src/hello.txt
+  printf 'unstaged retry tail\n' >> "$worktree/src/hello.txt"
+  status_before=$(git -C "$worktree" status --porcelain)
+  head_before=$(git -C "$worktree" rev-parse HEAD)
+  stub_count_before=$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)
+
+  run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation succeeds for one canonical RETRY" 0 "$?"
+  assert "attempt directory is published" test -d "$attempt_dir"
+  assert_eq "retry parent directory is mode 0700" 700 "$(perm_octal "$result_dir/retry")"
+  assert_eq "attempt directory is mode 0700" 700 "$(perm_octal "$attempt_dir")"
+  assert_eq "correction artifact is mode 0600" 600 "$(perm_octal "$attempt_dir/task.txt")"
+  assert_eq "before patch is mode 0600" 600 "$(perm_octal "$attempt_dir/before.patch")"
+  assert_eq "before file list is mode 0600" 600 "$(perm_octal "$attempt_dir/before-files.txt")"
+  assert_eq "prepared metadata is mode 0600" 600 "$(perm_octal "$attempt_dir/PREPARED.json")"
+  assert "correction bytes are preserved exactly" cmp -s "$correction" "$attempt_dir/task.txt"
+  assert_contains "snapshot contains staged tracked content" "$(cat "$attempt_dir/before.patch")" "STUB CHANGE"
+  assert_contains "snapshot contains unstaged tracked content" "$(cat "$attempt_dir/before.patch")" "unstaged retry tail"
+  assert_contains "snapshot contains untracked text content" "$(cat "$attempt_dir/before.patch")" "stub new file"
+  assert_contains "snapshot names the untracked binary" "$(cat "$attempt_dir/before.patch")" "stub-new-binary.bin"
+  assert_contains "snapshot embeds an untracked binary patch" "$(cat "$attempt_dir/before.patch")" "GIT binary patch"
+  assert_contains "before file list contains tracked change" "$(cat "$attempt_dir/before-files.txt")" "src/hello.txt"
+  assert_contains "before file list contains untracked text" "$(cat "$attempt_dir/before-files.txt")" "stub-new-file.txt"
+  assert_contains "before file list contains untracked binary" "$(cat "$attempt_dir/before-files.txt")" "stub-new-binary.bin"
+  assert_contains "prepared metadata has v1 schema" "$(cat "$attempt_dir/PREPARED.json")" '"schema": "dual-engine-retry.v1"'
+  assert_contains "prepared metadata records PREPARED status" "$(cat "$attempt_dir/PREPARED.json")" '"status": "PREPARED"'
+  assert_contains "prepared metadata records three changed files" "$(cat "$attempt_dir/PREPARED.json")" '"changed_file_count": 3'
+  expected_sha=$(shasum -a 256 "$attempt_dir/before.patch" | awk '{print $1}')
+  actual_sha=$(sed -n 's/.*"patch_sha256": "\([0-9a-fA-F]*\)".*/\1/p' "$attempt_dir/PREPARED.json")
+  assert_eq "prepared patch SHA-256 matches immutable artifact" "$expected_sha" "$actual_sha"
+
+  status_after=$(git -C "$worktree" status --porcelain)
+  head_after=$(git -C "$worktree" rev-parse HEAD)
+  stub_count_after=$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)
+  assert_eq "retry preparation does not change worktree status" "$status_before" "$status_after"
+  assert_eq "retry preparation does not change worktree HEAD" "$head_before" "$head_after"
+  assert_eq "retry preparation never invokes the model" "$stub_count_before" "$stub_count_after"
+
+  run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "a second retry attempt is refused" 1 "$?"
+
+  local repo2 task2 worktree2
+  repo2=$(new_repo retry-unregistered)
+  reset_stub
+  run_worker "$repo2" "create task whose worktree will be unregistered"
+  assert_eq "worker run for unregistered-worktree case succeeds" 0 "$WORKER_RC"
+  task2="$WORKER_STDOUT"
+  worktree2="$TEST_DATA/tasks/$task2/worktree"
+  run_review "$task2" RETRY "test registration gate" >/dev/null 2>&1
+  git -C "$worktree2" add -A
+  git -C "$worktree2" commit -qm "unexpected delegated commit"
+  run_retry prepare "$task2" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects a worktree commit beyond the source base" 1 "$?"
+  git -C "$repo2" worktree remove --force "$worktree2" >/dev/null 2>&1
+  mkdir -p "$worktree2"
+  run_retry prepare "$task2" --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects an unregistered worktree path" 1 "$?"
+
+  mkdir -p "$TEST_TMP/retry-outside"
+  ln -s "$TEST_TMP/retry-outside" "$TEST_DATA/tasks/retry-symlink"
+  run_retry prepare retry-symlink --task-file "$correction" >/dev/null 2>&1
+  assert_eq "retry preparation rejects a symlinked managed task" 1 "$?"
+}
+
 # --- 8. cleanup validation and preservation ------------------------------
 
 test_clean() {
@@ -855,6 +994,7 @@ test_dirty_repo_rejected
 test_model_failure_distinguished
 test_review
 test_review_pass_gate
+test_retry_prepare
 test_clean
 test_install_uninstall
 test_codex_ds

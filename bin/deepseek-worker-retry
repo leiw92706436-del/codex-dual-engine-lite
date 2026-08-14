@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# Codex Dual Engine Lite - single-delta retry preparation (macOS v0.2.0)
+#
+# Prepares an immutable snapshot for exactly one retry of a reviewed worker
+# task. This command is read-only with respect to both the source repository
+# and the task worktree: it records the current worktree diff and the exact
+# correction bytes under result/retry/attempt-1, and it never invokes a model,
+# applies a patch, or modifies the caller's repository.
+
+set -euo pipefail
+shopt -s extglob 2>/dev/null || true
+
+VERSION="0.2.0"
+PROGRAM="deepseek-worker-retry"
+
+die() {
+  local message="$1" status="${2:-1}"
+  printf '%s: error: %s\n' "$PROGRAM" "$message" >&2
+  exit "$status"
+}
+info() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+
+CDE_USER_HOME="${HOME:-/tmp}"
+
+data_home() {
+  local d="${CODEX_DUAL_ENGINE_LITE_HOME:-}"
+  if [[ -z "$d" ]]; then
+    d="$CDE_USER_HOME/.local/share/codex-dual-engine-lite"
+  fi
+  printf '%s\n' "$d"
+}
+
+valid_task_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  case "$1" in
+    *..*) return 1 ;;
+  esac
+  return 0
+}
+
+is_within() {
+  local path="$1" base="$2" rp rb
+  [[ -d "$path" && -d "$base" ]] || return 1
+  rp=$(cd -P "$path" 2>/dev/null && pwd -P) || return 1
+  rb=$(cd -P "$base" 2>/dev/null && pwd -P) || return 1
+  case "$rp" in
+    "$rb"|"$rb"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s\n' "$s"
+}
+
+file_size() {
+  local path="$1"
+  [[ -f "$path" ]] || { printf '0\n'; return 0; }
+  wc -c < "$path" | tr -d ' '
+}
+
+marker_field() {
+  local key="$1" value count
+  count=$(grep -c "^$key=" "$marker" 2>/dev/null || true)
+  [[ "$count" == "1" ]] || die "managed marker has missing, duplicate, or ambiguous field: $key" 1
+  value=$(sed -n "s/^$key=//p" "$marker")
+  [[ -n "$value" ]] || die "managed marker has empty field: $key" 1
+  printf '%s\n' "$value"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: deepseek-worker-retry prepare TASK_ID --task-file FILE
+
+Prepares one immutable retry snapshot for a reviewed worker task. The task's
+SOL_REVIEW.md must contain exactly one RETRY verdict, and the correction file
+must be non-empty and at most 50000 bytes. Nothing is merged, applied, or
+invoked; the task worktree and source repository are not modified.
+
+options:
+  -h, --help          show this help
+
+environment:
+  CODEX_DUAL_ENGINE_LITE_HOME       product data directory
+EOF
+  exit 0
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage ;;
+  esac
+done
+
+[[ $# -ge 1 ]] || die "expected 'prepare TASK_ID --task-file FILE'" 2
+[[ "$1" == "prepare" ]] || die "expected subcommand 'prepare'" 2
+shift
+
+task_id=""
+task_file=""
+
+while (($# > 0)); do
+  case "$1" in
+    --task-file)
+      [[ $# -ge 2 ]] || die "missing value for --task-file" 2
+      [[ -z "$task_file" ]] || die "--task-file specified more than once" 2
+      task_file="$2"
+      shift 2
+      ;;
+    --task-file=*)
+      [[ -z "$task_file" ]] || die "--task-file specified more than once" 2
+      task_file="${1#*=}"
+      shift
+      ;;
+    -*)
+      die "unknown option: $1" 2 ;;
+    *)
+      [[ -z "$task_id" ]] || die "expected exactly one task id" 2
+      task_id="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$task_id" ]] || die "missing task id" 2
+valid_task_id "$task_id" || die "invalid task id: $task_id" 2
+[[ -n "$task_file" ]] || die "missing --task-file FILE" 2
+
+[[ -f "$task_file" && ! -L "$task_file" ]] || die "task file not found or is a symlink: $task_file" 2
+task_bytes=$(file_size "$task_file")
+[[ "$task_bytes" =~ ^[0-9]+$ ]] || die "could not determine task file size" 2
+((task_bytes > 0)) || die "task file is empty" 2
+((task_bytes <= 50000)) || die "task file exceeds the 50000 byte safety limit" 2
+
+data="$(data_home)"
+[[ "$data" == /* ]] || die "data directory must be an absolute path: $data" 1
+[[ "$data" != "/" && "$data" != "$CDE_USER_HOME" && "$data" != "$CDE_USER_HOME/" ]] \
+  || die "refusing to use '$data' as the data directory" 1
+
+tasks_root="$data/tasks"
+task_dir="$tasks_root/$task_id"
+result_dir="$task_dir/result"
+worktree="$task_dir/worktree"
+marker="$task_dir/.managed"
+retry_dir="$result_dir/retry"
+attempt_dir="$retry_dir/attempt-1"
+review_file="$result_dir/SOL_REVIEW.md"
+
+if ! command -v git >/dev/null 2>&1; then
+  die "required command 'git' not found" 1
+fi
+if ! command -v shasum >/dev/null 2>&1; then
+  die "required command 'shasum' not found" 1
+fi
+
+# --- managed path and symlink validation ---------------------------------
+
+[[ -d "$tasks_root" ]] || die "managed tasks directory not found: $tasks_root" 1
+[[ -d "$task_dir" && -f "$marker" ]] || die "no managed task found for id: $task_id" 1
+[[ -d "$result_dir" ]] || die "result directory not found: $result_dir" 1
+[[ -d "$worktree" ]] || die "task worktree not found: $worktree" 1
+
+for p in "$tasks_root" "$task_dir" "$result_dir" "$worktree" "$marker"; do
+  [[ -L "$p" ]] && die "refusing symlinked path: $p" 1
+done
+
+is_within "$task_dir" "$tasks_root" || die "task path escapes managed tasks directory" 1
+is_within "$result_dir" "$task_dir" || die "result path escapes task directory" 1
+is_within "$worktree" "$task_dir" || die "worktree path escapes task directory" 1
+
+if ! grep -qxF "task_id=$task_id" "$marker"; then
+  die "managed marker does not match task id: $task_id" 1
+fi
+
+branch=$(marker_field branch)
+[[ "$branch" == "codex-ds/$task_id" ]] \
+  || die "managed marker has an unexpected branch: $branch" 1
+
+# Resolve the worktree canonically (on macOS /var is a symlink to /private/var)
+# so exact `git worktree list` comparisons match.
+worktree=$(cd -P "$worktree" 2>/dev/null && pwd -P) || die "could not resolve worktree path" 1
+is_within "$worktree" "$task_dir" || die "resolved worktree path escapes task directory" 1
+
+# --- registered Git worktree, branch, and source repository ---------------
+
+if ! git -C "$worktree" rev-parse --git-dir >/dev/null 2>&1; then
+  die "path is not a Git worktree: $worktree" 1
+fi
+if ! git -C "$worktree" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $worktree"; then
+  die "worktree is not registered with Git: $worktree" 1
+fi
+
+wt_branch=$(git -C "$worktree" symbolic-ref --short HEAD 2>/dev/null || true)
+[[ "$wt_branch" == "$branch" ]] \
+  || die "worktree branch '$wt_branch' does not match managed branch '$branch'" 1
+
+common_git_dir=$(git -C "$worktree" rev-parse --git-common-dir 2>/dev/null || true)
+[[ -n "$common_git_dir" ]] || die "could not resolve common Git directory" 1
+case "$common_git_dir" in
+  /*) ;;
+  *) common_git_dir="$worktree/$common_git_dir" ;;
+esac
+repo_root=$(cd "$common_git_dir/.." 2>/dev/null && pwd -P) || die "could not resolve repository root" 1
+
+marker_repo=$(marker_field repo)
+[[ "$marker_repo" == /* ]] || die "managed marker has invalid source repository" 1
+marker_repo=$(cd -P "$marker_repo" 2>/dev/null && pwd -P) || die "source repository no longer exists" 1
+[[ "$marker_repo" == "$repo_root" ]] \
+  || die "source repository does not match the registered worktree" 1
+
+source_head=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)
+worktree_head=$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)
+[[ -n "$source_head" && "$worktree_head" == "$source_head" ]] \
+  || die "task worktree and source repository are not at the same base commit" 1
+
+if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  die "source repository is not a Git worktree" 1
+fi
+if ! repo_status=$(git -C "$repo_root" status --porcelain 2>/dev/null); then
+  die "cannot verify source repository cleanliness" 1
+fi
+[[ -z "$repo_status" ]] || die "source repository is not clean" 1
+
+# --- review verdict validation --------------------------------------------
+
+[[ -f "$review_file" && ! -L "$review_file" ]] \
+  || die "SOL_REVIEW.md is missing or unsafe: $review_file" 1
+
+verdict_count=$(grep -c -E -i '^[[:space:]]*verdict[[:space:]]*:' "$review_file" 2>/dev/null || true)
+[[ "$verdict_count" =~ ^[0-9]+$ ]] || die "could not parse SOL_REVIEW.md" 1
+[[ "$verdict_count" == "1" ]] \
+  || die "SOL_REVIEW.md must contain exactly one verdict (found ${verdict_count:-0})" 1
+grep -qxF 'verdict: RETRY' "$review_file" \
+  || die "SOL_REVIEW.md must contain exactly the canonical RETRY verdict" 1
+
+# --- single-attempt gate ---------------------------------------------------
+
+if [[ -e "$attempt_dir" || -L "$attempt_dir" ]]; then
+  die "retry attempt already exists: $attempt_dir" 1
+fi
+if [[ -e "$retry_dir" && ! -d "$retry_dir" ]]; then
+  die "retry path is not a directory: $retry_dir" 1
+fi
+[[ ! -L "$retry_dir" ]] || die "refusing symlinked retry directory: $retry_dir" 1
+
+# --- build the snapshot atomically ----------------------------------------
+
+umask 077
+if [[ ! -d "$retry_dir" ]]; then
+  mkdir "$retry_dir" || die "failed to create retry directory: $retry_dir" 1
+fi
+chmod 700 "$retry_dir" 2>/dev/null || true
+
+tmp_dir=$(mktemp -d "$retry_dir/.attempt-1.XXXXXX") || die "failed to create temporary attempt directory" 1
+chmod 700 "$tmp_dir" 2>/dev/null || true
+
+cleanup_tmp() { rm -rf -- "$tmp_dir"; }
+trap cleanup_tmp EXIT
+
+cp -- "$task_file" "$tmp_dir/task.txt" || die "failed to copy correction task bytes" 1
+chmod 600 "$tmp_dir/task.txt"
+
+base_commit="$worktree_head"
+tracked_paths="$tmp_dir/.tracked-paths"
+untracked_paths="$tmp_dir/.untracked-paths"
+unsorted_files="$tmp_dir/.before-files.unsorted"
+
+git -c core.quotePath=false -C "$worktree" diff --name-only -z HEAD -- > "$tracked_paths" \
+  || die "failed to enumerate tracked changes" 1
+git -c core.quotePath=false -C "$worktree" ls-files --others --exclude-standard -z > "$untracked_paths" \
+  || die "failed to enumerate untracked changes" 1
+
+git -C "$worktree" diff --binary --no-ext-diff --find-renames HEAD -- > "$tmp_dir/before.patch" \
+  || die "failed to snapshot tracked changes" 1
+: > "$unsorted_files"
+
+while IFS= read -r -d '' rel; do
+  [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+    || die "changed path cannot be represented safely" 1
+  printf '%s\n' "$rel" >> "$unsorted_files"
+done < "$tracked_paths"
+
+while IFS= read -r -d '' rel; do
+  [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+    || die "changed path cannot be represented safely" 1
+  [[ -f "$worktree/$rel" || -L "$worktree/$rel" ]] \
+    || die "unsupported untracked file type: $rel" 1
+  printf '%s\n' "$rel" >> "$unsorted_files"
+  if git -c core.quotePath=false -C "$worktree" diff --no-index --binary --no-ext-diff -- /dev/null "$rel" \
+    >> "$tmp_dir/before.patch" 2>/dev/null; then
+    :
+  else
+    diff_rc=$?
+    [[ "$diff_rc" == "1" ]] || die "failed to snapshot untracked file: $rel" 1
+  fi
+done < "$untracked_paths"
+chmod 600 "$tmp_dir/before.patch"
+
+LC_ALL=C sort -u "$unsorted_files" > "$tmp_dir/before-files.txt" \
+  || die "failed to normalize changed-file list" 1
+chmod 600 "$tmp_dir/before-files.txt"
+
+changed_count=$(wc -l < "$tmp_dir/before-files.txt" | tr -d ' ')
+[[ "$changed_count" =~ ^[0-9]+$ ]] || die "failed to count changed files" 1
+rm -f -- "$tracked_paths" "$untracked_paths" "$unsorted_files"
+if ! patch_sha256=$(shasum -a 256 "$tmp_dir/before.patch" | awk '{print $1}'); then
+  die "failed to compute patch SHA-256" 1
+fi
+[[ "$patch_sha256" =~ ^[0-9a-fA-F]{64}$ ]] || die "failed to compute patch SHA-256" 1
+
+prepared_at=$(TZ=UTC date '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)
+[[ -n "$prepared_at" ]] || prepared_at=$(TZ=UTC date '+%Y-%m-%dT%H:%M:%SZ')
+
+{
+  printf '{\n'
+  printf '  "schema": "dual-engine-retry.v1",\n'
+  printf '  "version": "%s",\n' "$(json_escape "$VERSION")"
+  printf '  "task_id": "%s",\n' "$(json_escape "$task_id")"
+  printf '  "base_commit": "%s",\n' "$(json_escape "$base_commit")"
+  printf '  "patch_sha256": "%s",\n' "$(json_escape "$patch_sha256")"
+  printf '  "changed_file_count": %s,\n' "$changed_count"
+  printf '  "prepared_at": "%s",\n' "$(json_escape "$prepared_at")"
+  printf '  "status": "PREPARED"\n'
+  printf '}\n'
+} > "$tmp_dir/PREPARED.json"
+chmod 600 "$tmp_dir/PREPARED.json"
+
+mv -- "$tmp_dir" "$attempt_dir" || die "failed to publish retry attempt" 1
+trap - EXIT
+
+info "prepared retry attempt for $task_id"
+exit 0
