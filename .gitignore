@@ -1,0 +1,24 @@
+# macOS
+.DS_Store
+
+# Editor / tooling
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local product data and configuration (never commit)
+.local/
+.codex-dual-engine-lite/
+config.toml
+install-manifest.tsv
+
+# Test artifacts
+tests/tmp/
+tests/*.tmp/
+*.bak.*
+
+# Generated result packages (created by the worker under the data directory,
+# not normally inside the checkout, but ignored just in case)
+results/
+worktree/

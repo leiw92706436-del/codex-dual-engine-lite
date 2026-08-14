@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Codex Dual Engine Lite - review gate recorder (macOS v0.1.0)
+#
+# Records an independent human/Sol verdict for an exact task id. This is a
+# recorder, not a fake reviewer: it validates inputs and writes SOL_REVIEW.md
+# atomically without printing sensitive task logs and without merging or
+# applying anything.
+
+set -euo pipefail
+shopt -s extglob 2>/dev/null || true
+
+VERSION="0.1.0"
+PROGRAM="deepseek-worker-review"
+
+die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit "${2:-1}"; }
+info() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+
+HOME="${HOME:-/tmp}"
+
+data_home() {
+  local d="${CODEX_DUAL_ENGINE_LITE_HOME:-}"
+  if [[ -z "$d" ]]; then
+    d="$HOME/.local/share/codex-dual-engine-lite"
+  fi
+  printf '%s\n' "$d"
+}
+
+valid_task_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  case "$1" in
+    *..*) return 1 ;;
+  esac
+  return 0
+}
+
+is_within() {
+  local path="$1" base="$2" rp rb
+  [[ -d "$path" && -d "$base" ]] || return 1
+  rp=$(cd -P "$path" 2>/dev/null && pwd -P) || return 1
+  rb=$(cd -P "$base" 2>/dev/null && pwd -P) || return 1
+  case "$rp" in
+    "$rb"|"$rb"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: deepseek-worker-review TASK_ID PASS|RETRY|TAKEOVER [NOTE...]
+
+Records an independent human/Sol verdict for a completed worker task. The
+verdict is written atomically to SOL_REVIEW.md in the task result directory.
+Nothing is merged or applied.
+
+options:
+  -h, --help   show this help
+EOF
+  exit 0
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage ;;
+  esac
+done
+
+if (($# < 2)); then
+  die "expected TASK_ID and verdict (PASS, RETRY, or TAKEOVER)" 2
+fi
+
+task_id="$1"
+verdict="$2"
+shift 2
+note="$*"
+
+valid_task_id "$task_id" || die "invalid task id: $task_id" 2
+
+case "$verdict" in
+  PASS|RETRY|TAKEOVER) ;;
+  *) die "invalid verdict '$verdict'; expected PASS, RETRY, or TAKEOVER" 2 ;;
+esac
+
+data="$(data_home)"
+[[ "$data" == /* ]] || die "data directory must be an absolute path" 1
+
+tasks_root="$data/tasks"
+task_dir="$tasks_root/$task_id"
+result_dir="$task_dir/result"
+marker="$task_dir/.managed"
+
+# Defend against path traversal and symlink escapes.
+[[ -d "$tasks_root" ]] || die "managed tasks directory not found: $tasks_root" 1
+[[ -d "$task_dir" && -f "$marker" ]] || die "no managed task found for id: $task_id" 1
+[[ -d "$result_dir" ]] || die "result directory not found: $result_dir" 1
+
+for p in "$tasks_root" "$task_dir" "$result_dir" "$marker"; do
+  [[ -L "$p" ]] && die "refusing symlinked path: $p" 1
+done
+
+is_within "$task_dir" "$tasks_root" || die "task path escapes managed tasks directory" 1
+is_within "$result_dir" "$task_dir" || die "result path escapes task directory" 1
+
+# Confirm the marker belongs to this exact task id.
+if ! grep -qxF "task_id=$task_id" "$marker"; then
+  die "managed marker does not match task id: $task_id" 1
+fi
+
+recorded_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
+target="$result_dir/SOL_REVIEW.md"
+
+umask 077
+tmp=$(mktemp "$result_dir/.sol-review.XXXXXX") || die "failed to create review temp file" 1
+cleanup_tmp() { rm -f -- "$tmp"; }
+trap cleanup_tmp EXIT
+
+{
+  printf '# Sol review record\n'
+  printf '\n'
+  printf 'task_id: %s\n' "$task_id"
+  printf 'verdict: %s\n' "$verdict"
+  if [[ -n "$note" ]]; then
+    printf 'note: %s\n' "$note"
+  fi
+  printf 'recorded_at: %s\n' "$recorded_at"
+  printf 'recorder: %s v%s\n' "$PROGRAM" "$VERSION"
+} > "$tmp"
+chmod 600 "$tmp"
+mv -f -- "$tmp" "$target"
+trap - EXIT
+
+info "recorded verdict '$verdict' for task $task_id"
+info "review file: $target"
+exit 0

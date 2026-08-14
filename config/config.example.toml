@@ -1,0 +1,41 @@
+# Codex Dual Engine Lite - example configuration.
+#
+# Copy this file to $CODEX_DUAL_ENGINE_LITE_HOME/config.toml and edit it.
+# Default location: ~/.local/share/codex-dual-engine-lite/config.toml
+#
+# This file must never contain real credentials. The API key is stored only in
+# the macOS Keychain (see SECURITY.md and README.md).
+#
+# Only full-line comments are supported by the bundled parser; avoid inline
+# comments after a value.
+
+[provider]
+# Provider identifier used in the generated Codex CLI config.
+name = "deepseek"
+# OpenAI-compatible endpoint for your provider (or gateway). Replace this.
+base_url = "REPLACE_WITH_BASE_URL"
+# Model name. Replace with the model your account is authorized to use.
+model = "REPLACE_WITH_MODEL"
+# Environment variable name that Codex CLI will read for the API key.
+env_key = "DEEPSEEK_API_KEY"
+
+[keychain]
+# Keychain service and account names. These are identifiers, not secrets.
+service = "codex-dual-engine-lite"
+account = "deepseek-api-key"
+
+[execution]
+# Sandbox policy for model-generated shell commands.
+# Allowed values: "read-only" or "workspace-write".
+# "danger-full-access" is deliberately rejected.
+sandbox = "workspace-write"
+# Explicit opt-in for automatic approval of the model's suggested commands.
+# When true, codex-ds passes Codex's "--approve-for-me" flag, which still runs
+# inside the workspace-write sandbox. This is NOT a sandbox/approval bypass.
+auto_approve = false
+
+[preflight]
+# Optional, narrowly scoped allowlist for the secret preflight scanner.
+# Comma-separated shell-style globs matched against repository-relative paths
+# and file basenames. Example: "docs/example.pem,fixtures/*.key"
+allowlist = ""

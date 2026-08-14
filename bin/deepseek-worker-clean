@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Codex Dual Engine Lite - managed cleanup (macOS v0.1.0)
+#
+# Validates the exact managed task/worktree/branch relationship, requires
+# explicit confirmation, and removes only the managed worktree and branch while
+# preserving the result package and logs.
+
+set -euo pipefail
+shopt -s extglob 2>/dev/null || true
+
+VERSION="0.1.0"
+PROGRAM="deepseek-worker-clean"
+
+die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit "${2:-1}"; }
+info() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+
+HOME="${HOME:-/tmp}"
+
+data_home() {
+  local d="${CODEX_DUAL_ENGINE_LITE_HOME:-}"
+  if [[ -z "$d" ]]; then
+    d="$HOME/.local/share/codex-dual-engine-lite"
+  fi
+  printf '%s\n' "$d"
+}
+
+valid_task_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  case "$1" in
+    *..*) return 1 ;;
+  esac
+  return 0
+}
+
+is_within() {
+  local path="$1" base="$2" rp rb
+  [[ -d "$path" && -d "$base" ]] || return 1
+  rp=$(cd -P "$path" 2>/dev/null && pwd -P) || return 1
+  rb=$(cd -P "$base" 2>/dev/null && pwd -P) || return 1
+  case "$rp" in
+    "$rb"|"$rb"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: deepseek-worker-clean TASK_ID --yes
+       deepseek-worker-clean TASK_ID -y
+
+Removes the managed worktree and branch for TASK_ID, preserving the task
+result package and logs. The relationship is validated against both the
+managed marker and `git worktree list` before anything is removed.
+
+options:
+  -h, --help   show this help
+  -y, --yes    confirm without prompting
+EOF
+  exit 0
+}
+
+task_id=""
+yes=0
+
+while (($# > 0)); do
+  case "$1" in
+    -h|--help) usage ;;
+    -y|--yes) yes=1; shift ;;
+    -*)
+      die "unknown option: $1" 2 ;;
+    *)
+      [[ -z "$task_id" ]] || die "expected exactly one task id" 2
+      task_id="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$task_id" ]] || die "missing task id" 2
+valid_task_id "$task_id" || die "invalid task id: $task_id" 2
+
+data="$(data_home)"
+[[ "$data" == /* ]] || die "data directory must be an absolute path" 1
+
+tasks_root="$data/tasks"
+task_dir="$tasks_root/$task_id"
+result_dir="$task_dir/result"
+worktree="$task_dir/worktree"
+codex_home="$task_dir/codex-home"
+marker="$task_dir/.managed"
+
+[[ -d "$tasks_root" ]] || die "managed tasks directory not found: $tasks_root" 1
+[[ -d "$task_dir" && -f "$marker" ]] || die "no managed task found for id: $task_id" 1
+[[ -d "$result_dir" ]] || die "result directory not found (refusing cleanup): $result_dir" 1
+[[ -d "$worktree" ]] || die "worktree not found (already removed?): $worktree" 1
+
+for p in "$tasks_root" "$task_dir" "$result_dir" "$marker" "$worktree" "$codex_home"; do
+  [[ -L "$p" ]] && die "refusing symlinked path: $p" 1
+done
+
+# Resolve the worktree to its canonical absolute path (on macOS /var is a
+# symlink to /private/var) so exact `git worktree list` comparisons match.
+worktree=$(cd -P "$worktree" 2>/dev/null && pwd -P) || die "could not resolve worktree path" 1
+
+is_within "$task_dir" "$tasks_root" || die "task path escapes managed tasks directory" 1
+is_within "$worktree" "$task_dir" || die "worktree path escapes task directory" 1
+[[ ! -e "$codex_home" ]] || is_within "$codex_home" "$task_dir" || die "codex-home path escapes task directory" 1
+
+# Validate the managed marker relationship.
+if ! grep -qxF "task_id=$task_id" "$marker"; then
+  die "managed marker does not match task id: $task_id" 1
+fi
+
+branch=$(grep -E '^branch=' "$marker" | head -n 1 | cut -d= -f2- || true)
+if [[ -z "$branch" || "$branch" != "codex-ds/$task_id" ]]; then
+  die "managed marker has an unexpected branch: ${branch:-<empty>}" 1
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+  die "required command 'git' not found" 1
+fi
+
+# Validate the worktree and branch are actually registered with Git.
+if ! git -C "$worktree" rev-parse --git-dir >/dev/null 2>&1; then
+  die "path is not a Git worktree: $worktree" 1
+fi
+if ! git -C "$worktree" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $worktree"; then
+  die "worktree is not registered with Git: $worktree" 1
+fi
+wt_branch=$(git -C "$worktree" symbolic-ref --short HEAD 2>/dev/null || true)
+if [[ "$wt_branch" != "$branch" ]]; then
+  die "worktree branch '$wt_branch' does not match managed branch '$branch'" 1
+fi
+
+# Derive the main repository root from the worktree's common Git directory.
+common_git_dir=$(git -C "$worktree" rev-parse --git-common-dir 2>/dev/null || true)
+if [[ -z "$common_git_dir" ]]; then
+  die "could not resolve common Git directory" 1
+fi
+case "$common_git_dir" in
+  /*) ;;
+  *) common_git_dir="$worktree/$common_git_dir" ;;
+esac
+repo_root=$(cd "$common_git_dir/.." 2>/dev/null && pwd -P) || die "could not resolve repository root" 1
+
+if [[ "$yes" != "1" ]]; then
+  printf 'Remove worktree and branch for task %s?\n' "$task_id" >&2
+  printf '  worktree: %s\n' "$worktree" >&2
+  printf '  branch:   %s\n' "$branch" >&2
+  printf 'Result package and logs are preserved. Proceed? [y/N] ' >&2
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    y|Y|yes|YES|Yes) ;;
+    *) info "aborted"; exit 0 ;;
+  esac
+fi
+
+info "removing worktree $worktree"
+if ! git -C "$repo_root" worktree remove --force "$worktree"; then
+  die "failed to remove worktree (see git output above)" 1
+fi
+
+info "removing branch $branch"
+if ! git -C "$repo_root" branch -D "$branch"; then
+  die "failed to remove branch '$branch'" 1
+fi
+
+if [[ -e "$codex_home" ]]; then
+  [[ -d "$codex_home" ]] || die "refusing to remove non-directory codex-home: $codex_home" 1
+  info "removing isolated codex-home $codex_home"
+  rm -rf -- "$codex_home"
+fi
+
+info "cleaned task $task_id (worktree and branch removed)"
+info "preserved result package: $result_dir"
+exit 0

@@ -1,0 +1,561 @@
+#!/usr/bin/env bash
+# Codex Dual Engine Lite - bounded worker (macOS v0.1.0)
+#
+# Accepts exactly one bounded task, requires a clean Git repository with a
+# HEAD, creates a uniquely named branch and a detached linked worktree under
+# the product data directory, runs a secret preflight, invokes codex-ds in that
+# worktree, and preserves an auditable result package.
+#
+# This worker never commits, merges, cherry-picks, pushes, or applies patches,
+# and never modifies the caller's main worktree.
+
+set -euo pipefail
+shopt -s extglob 2>/dev/null || true
+
+VERSION="0.1.0"
+PROGRAM="deepseek-worker"
+
+die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit "${2:-1}"; }
+info() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+
+HOME="${HOME:-/tmp}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)
+
+# --- configuration lookup -------------------------------------------------
+
+data_home() {
+  local d="${CODEX_DUAL_ENGINE_LITE_HOME:-}"
+  if [[ -z "$d" ]]; then
+    d="$HOME/.local/share/codex-dual-engine-lite"
+  fi
+  printf '%s\n' "$d"
+}
+
+config_file() {
+  local c="${CODEX_DUAL_ENGINE_LITE_CONFIG:-}"
+  if [[ -z "$c" ]]; then
+    c="$(data_home)/config.toml"
+  fi
+  printf '%s\n' "$c"
+}
+
+cfg_get() {
+  local file="$1" section="$2" key="$3" default="${4:-}"
+  local cur="" line k v first last
+  [[ -f "$file" ]] || {
+    [[ -n "$default" ]] && { printf '%s\n' "$default"; return 0; }
+    return 1
+  }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line##+([[:space:]])}"
+    line="${line%%+([[:space:]])}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" =~ ^\[[[:space:]]*(.+)[[:space:]]*\]$ ]]; then
+      cur="${BASH_REMATCH[1]}"
+      cur="${cur##+([[:space:]])}"
+      cur="${cur%%+([[:space:]])}"
+      continue
+    fi
+    if [[ "$line" =~ ^([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"
+      v="${BASH_REMATCH[2]}"
+      if [[ "$cur" == "$section" && "$k" == "$key" ]]; then
+        first="${v:0:1}"
+        last="${v: -1}"
+        if [[ "$first" == '"' && "$last" == '"' ]]; then
+          v="${v:1:${#v}-2}"
+        elif [[ "$first" == "'" && "$last" == "'" ]]; then
+          v="${v:1:${#v}-2}"
+        fi
+        printf '%s\n' "$v"
+        return 0
+      fi
+    fi
+  done < "$file"
+  [[ -n "$default" ]] && { printf '%s\n' "$default"; return 0; }
+  return 1
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s\n' "$s"
+}
+
+valid_task_id() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 1
+  case "$1" in
+    *..*) return 1 ;;
+  esac
+  return 0
+}
+
+is_within() {
+  local path="$1" base="$2" rp rb
+  [[ -d "$path" && -d "$base" ]] || return 1
+  rp=$(cd -P "$path" 2>/dev/null && pwd -P) || return 1
+  rb=$(cd -P "$base" 2>/dev/null && pwd -P) || return 1
+  case "$rp" in
+    "$rb"|"$rb"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- secret preflight -----------------------------------------------------
+
+# High-confidence secret filename patterns (matched against the lowercased
+# basename). Diagnostics report the matched pattern, never file contents.
+FILENAME_RULES=(
+  ".env" ".env"
+  ".env.*" ".env.*"
+  ".netrc" ".netrc"
+  ".npmrc" ".npmrc"
+  ".pypirc" ".pypirc"
+  ".pgpass" ".pgpass"
+  "id_rsa" "id_rsa"
+  "id_rsa.*" "id_rsa.*"
+  "id_dsa" "id_dsa"
+  "id_dsa.*" "id_dsa.*"
+  "id_ecdsa" "id_ecdsa"
+  "id_ecdsa.*" "id_ecdsa.*"
+  "id_ed25519" "id_ed25519"
+  "id_ed25519.*" "id_ed25519.*"
+  "*.pem" "*.pem"
+  "*.key" "*.key"
+  "*.p12" "*.p12"
+  "*.pfx" "*.pfx"
+  "*.p8" "*.p8"
+  "*.jks" "*.jks"
+  "*.keystore" "*.keystore"
+  "*.ppk" "*.ppk"
+  "credentials" "credentials"
+  "credentials.*" "credentials.*"
+  "credential" "credential"
+  "credential.*" "credential.*"
+  "secret" "secret"
+  "secrets" "secrets"
+  "secrets.*" "secrets.*"
+  "token" "token"
+  "tokens" "tokens"
+  "auth.json" "auth.json"
+  ".htpasswd" ".htpasswd"
+  "service-account.json" "service-account.json"
+  "service_account.json" "service_account.json"
+)
+
+# High-confidence secret content rules: rule-name followed by an extended
+# regular expression. These avoid short/placeholder values to minimize false
+# positives.
+CONTENT_RULES=(
+  "pem-private-key" "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+  "pgp-private-key" "-----BEGIN PGP PRIVATE KEY BLOCK-----"
+  "aws-access-key-id" "AKIA[0-9A-Z]{16}"
+  "github-token" "(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}"
+  "google-api-key" "AIza[0-9A-Za-z_-]{35}"
+  "openai-style-key" "sk-[A-Za-z0-9]{32,}"
+  "slack-token" "xox[baprs]-[0-9A-Za-z-]{10,}"
+  "npm-access-token" "npm_[A-Za-z0-9]{36}"
+)
+
+lowercase() { printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+is_allowed() {
+  local rel="$1" allow="$2" base
+  [[ -z "$allow" ]] && return 1
+  base=$(basename -- "$rel")
+  local old_ifs="$IFS" pat
+  IFS=','
+  for pat in $allow; do
+    pat="${pat##+([[:space:]])}"
+    pat="${pat%%+([[:space:]])}"
+    [[ -z "$pat" ]] && continue
+    case "$rel" in
+      $pat) IFS="$old_ifs"; return 0 ;;
+    esac
+    case "$base" in
+      $pat) IFS="$old_ifs"; return 0 ;;
+    esac
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+run_preflight() {
+  local wt="$1" allow="$2" rel base lb file rule pat i
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    is_allowed "$rel" "$allow" && continue
+
+    base=$(basename -- "$rel")
+    lb=$(lowercase "$base")
+    for ((i = 0; i < ${#FILENAME_RULES[@]}; i += 2)); do
+      rule="${FILENAME_RULES[$i]}"
+      pat="${FILENAME_RULES[$i+1]}"
+      case "$lb" in
+        $pat)
+          die "secret preflight blocked: $rel (rule: filename:$pat)" 4
+          ;;
+      esac
+    done
+
+    file="$wt/$rel"
+    [[ -f "$file" ]] || continue
+    for ((i = 0; i < ${#CONTENT_RULES[@]}; i += 2)); do
+      rule="${CONTENT_RULES[$i]}"
+      pat="${CONTENT_RULES[$i+1]}"
+      if grep -a -q -E -- "$pat" "$file" 2>/dev/null; then
+        die "secret preflight blocked: $rel (rule: content:$rule)" 4
+      fi
+    done
+  done < <(git -c core.quotePath=false -C "$wt" ls-files)
+}
+
+# --- argument parsing -----------------------------------------------------
+
+usage() {
+  cat >&2 <<'EOF'
+usage: deepseek-worker TASK
+       deepseek-worker --task-file FILE
+       deepseek-worker -            (read TASK from stdin)
+
+Runs one bounded task in an isolated worktree and writes a result package to
+the product data directory. The current directory must be inside a clean Git
+repository with a HEAD commit.
+
+options:
+  -h, --help          show this help
+  --task-file FILE    read the task from FILE instead of an argument
+
+environment:
+  CODEX_DUAL_ENGINE_LITE_HOME       product data directory
+  CODEX_DUAL_ENGINE_LITE_CONFIG     path to config.toml
+  CODEX_DUAL_ENGINE_LITE_CODEX_DS   path to codex-ds (default: sibling codex-ds)
+EOF
+  exit 0
+}
+
+task_text=""
+task_file=""
+
+while (($# > 0)); do
+  case "$1" in
+    -h|--help) usage ;;
+    --task-file)
+      [[ $# -ge 2 ]] || die "missing value for --task-file" 2
+      task_file="$2"
+      shift 2
+      ;;
+    --task-file=*)
+      task_file="${1#*=}"
+      shift
+      ;;
+    --)
+      shift
+      [[ $# -ge 1 ]] || die "missing task" 2
+      task_text="$1"
+      shift
+      [[ $# -eq 0 ]] || die "expected exactly one task" 2
+      ;;
+    -*)
+      die "unknown option: $1" 2 ;;
+    *)
+      [[ -z "$task_text" ]] || die "expected exactly one task" 2
+      task_text="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$task_file" ]]; then
+  [[ -n "$task_text" ]] && die "specify either a task argument or --task-file, not both" 2
+  [[ -f "$task_file" ]] || die "task file not found: $task_file" 2
+  task_text=$(cat -- "$task_file" || true)
+elif [[ -z "$task_text" ]]; then
+  die "missing task; provide one bounded task argument" 2
+fi
+
+[[ -n "$task_text" ]] || die "task is empty" 2
+if ((${#task_text} > 200000)); then
+  die "task exceeds the 200000 byte safety limit" 2
+fi
+
+# --- resolve data and config ---------------------------------------------
+
+data="$(data_home)"
+cfg="$(config_file)"
+
+if [[ "$data" != /* ]]; then
+  die "data directory must be an absolute path: $data" 1
+fi
+if [[ "$data" == "/" || "$data" == "$HOME" || "$data" == "$HOME/" ]]; then
+  die "refusing to use '$data' as the data directory" 1
+fi
+
+# --- validate repository --------------------------------------------------
+
+if ! command -v git >/dev/null 2>&1; then
+  die "required command 'git' not found" 1
+fi
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  die "current directory is not inside a Git repository" 3
+fi
+if [[ "$(git rev-parse --is-bare-repository 2>/dev/null)" == "true" ]]; then
+  die "bare repositories are not supported" 3
+fi
+if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+  die "repository has no HEAD commit" 3
+fi
+for ref in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_HEAD; do
+  if git rev-parse -q --verify "$ref" >/dev/null 2>&1; then
+    die "repository has an in-progress operation ($ref); finish or abort it first" 3
+  fi
+done
+
+repo_root=$(git rev-parse --show-toplevel)
+repo_root=$(cd "$repo_root" && pwd -P)
+head_commit=$(git -C "$repo_root" rev-parse HEAD)
+git_version=$(git --version 2>/dev/null || printf 'unknown')
+
+repo_dirty=$(git -C "$repo_root" status --porcelain 2>/dev/null || true)
+if [[ -n "$repo_dirty" ]]; then
+  die "repository is not clean; commit or stash changes before delegating" 3
+fi
+
+if is_within "$repo_root" "$data/tasks" 2>/dev/null; then
+  die "refusing to run inside the product data directory's managed tasks" 3
+fi
+
+# --- task identity and paths ---------------------------------------------
+
+rand=$(od -An -N6 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+[[ -n "$rand" ]] || rand=$(printf '%06x' "$$")
+task_id="ds-$(date +%Y%m%d-%H%M%S)-$rand"
+branch="codex-ds/$task_id"
+
+task_dir="$data/tasks/$task_id"
+worktree="$task_dir/worktree"
+result_dir="$task_dir/result"
+logfile="$result_dir/worker.log"
+codex_ds="${CODEX_DUAL_ENGINE_LITE_CODEX_DS:-$SCRIPT_DIR/codex-ds}"
+
+if [[ ! -x "$codex_ds" && "$codex_ds" != */* ]]; then
+  codex_ds=$(command -v "$codex_ds" 2>/dev/null || true)
+fi
+[[ -n "$codex_ds" && -x "$codex_ds" ]] || die "codex-ds executable not found: ${CODEX_DUAL_ENGINE_LITE_CODEX_DS:-$SCRIPT_DIR/codex-ds}" 1
+
+now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+created_at=$(now)
+
+umask 077
+mkdir -p "$result_dir"
+chmod 700 "$task_dir" "$result_dir" 2>/dev/null || true
+
+log() {
+  printf '[%s] %s\n' "$(now)" "$*" >> "$logfile"
+}
+say() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  log "$*"
+}
+
+log "worker $VERSION starting"
+log "task_id=$task_id"
+log "repo_root=$repo_root"
+log "head_commit=$head_commit"
+log "branch=$branch"
+
+# Managed marker + task text. The marker is used by review/clean to validate
+# the managed relationship.
+{
+  printf 'task_id=%s\n' "$task_id"
+  printf 'repo=%s\n' "$repo_root"
+  printf 'branch=%s\n' "$branch"
+  printf 'created_at=%s\n' "$created_at"
+  printf 'worker_version=%s\n' "$VERSION"
+} > "$task_dir/.managed"
+chmod 600 "$task_dir/.managed"
+
+printf '%s\n' "$task_text" > "$result_dir/task.txt"
+chmod 600 "$result_dir/task.txt"
+
+# --- create the isolated worktree ----------------------------------------
+
+say "creating worktree $worktree"
+if ! git -C "$repo_root" worktree add -b "$branch" "$worktree" "$head_commit" >>"$logfile" 2>&1; then
+  say "worktree creation failed (see $logfile)"
+  exit 5
+fi
+log "worktree created at $worktree"
+
+# --- secret preflight -----------------------------------------------------
+
+allowlist="${CODEX_DUAL_ENGINE_LITE_PREFLIGHT_ALLOWLIST:-$(cfg_get "$cfg" preflight allowlist "")}"
+say "running secret preflight"
+if run_preflight "$worktree" "$allowlist"; then
+  log "preflight passed"
+else
+  # run_preflight exits non-zero only via die(), which already exited.
+  exit 4
+fi
+
+# --- invoke the model -----------------------------------------------------
+
+export CODEX_DUAL_ENGINE_LITE_HOME="$data"
+export CODEX_DUAL_ENGINE_LITE_CONFIG="$cfg"
+export CODEX_DUAL_ENGINE_LITE_TASK_ID="$task_id"
+
+started_at=$(now)
+say "invoking $codex_ds in worktree"
+
+model_rc=0
+cd "$worktree"
+if printf '%s\n' "$task_text" | "$codex_ds" >>"$logfile" 2>&1; then
+  model_rc=0
+else
+  model_rc=$?
+fi
+cd "$repo_root"
+finished_at=$(now)
+
+log "model exit status: $model_rc"
+
+# --- capture results ------------------------------------------------------
+
+tracked=$(git -C "$worktree" diff --name-only 2>/dev/null || true)
+cached=$(git -C "$worktree" diff --name-only --cached 2>/dev/null || true)
+untracked=$(git -c core.quotePath=false -C "$worktree" ls-files --others --exclude-standard 2>/dev/null || true)
+changed_files=$(printf '%s\n%s\n%s\n' "$tracked" "$cached" "$untracked" | sort -u | grep -v '^$' || true)
+
+tracked_count=$(printf '%s\n' "$tracked" | grep -c -v '^$' || true)
+untracked_count=$(printf '%s\n' "$untracked" | grep -c -v '^$' || true)
+changed_count=$(printf '%s\n' "$changed_files" | grep -c -v '^$' || true)
+
+if [[ -n "$changed_files" ]]; then
+  files_changed=true
+else
+  files_changed=false
+fi
+
+{
+  # Tracked modifications, staged changes, deletions, and renames are all
+  # covered by comparing HEAD to the working tree. This never stages or
+  # otherwise mutates the delegated worktree index.
+  git -C "$worktree" diff --binary --no-ext-diff --find-renames HEAD 2>/dev/null || true
+
+  # Untracked new files are not visible to `git diff HEAD`, so append a
+  # git-style new-file patch for each one. `--no-index` compares the file
+  # against /dev/null and, with `--binary`, embeds binary content as a Git
+  # binary patch. Iterating over NUL-delimited ls-files output preserves
+  # repository-relative paths and handles spaces/control characters safely.
+  while IFS= read -r -d '' rel; do
+    if [[ -f "$worktree/$rel" || -L "$worktree/$rel" ]]; then
+      git -c core.quotePath=false -C "$worktree" diff --no-index --binary --no-ext-diff -- /dev/null "$rel" 2>/dev/null || true
+    fi
+  done < <(git -c core.quotePath=false -C "$worktree" ls-files --others --exclude-standard -z 2>/dev/null || true)
+} > "$result_dir/diff.patch"
+printf '%s\n' "$changed_files" > "$result_dir/changed-files.txt"
+chmod 600 "$result_dir/diff.patch" "$result_dir/changed-files.txt"
+
+main_dirty_after=$(git -C "$repo_root" status --porcelain 2>/dev/null || true)
+main_clean_after=false
+[[ -z "$main_dirty_after" ]] && main_clean_after=true
+
+task_sha256=$(printf '%s' "$task_text" | shasum -a 256 | awk '{print $1}')
+
+auto_approve_val=$(cfg_get "$cfg" execution auto_approve "false")
+case "$auto_approve_val" in
+  true) auto_approve_val=true ;;
+  *) auto_approve_val=false ;;
+esac
+
+metadata="$result_dir/metadata.json"
+{
+  printf '{\n'
+  printf '  "product": "codex-dual-engine-lite",\n'
+  printf '  "version": "%s",\n' "$(json_escape "$VERSION")"
+  printf '  "task_id": "%s",\n' "$(json_escape "$task_id")"
+  printf '  "branch": "%s",\n' "$(json_escape "$branch")"
+  printf '  "repo_root": "%s",\n' "$(json_escape "$repo_root")"
+  printf '  "head_commit": "%s",\n' "$(json_escape "$head_commit")"
+  printf '  "worktree": "%s",\n' "$(json_escape "$worktree")"
+  printf '  "result_dir": "%s",\n' "$(json_escape "$result_dir")"
+  printf '  "created_at": "%s",\n' "$(json_escape "$created_at")"
+  printf '  "started_at": "%s",\n' "$(json_escape "$started_at")"
+  printf '  "finished_at": "%s",\n' "$(json_escape "$finished_at")"
+  printf '  "model_exit_status": %s,\n' "$model_rc"
+  printf '  "files_changed": %s,\n' "$files_changed"
+  printf '  "changed_file_count": %s,\n' "$changed_count"
+  printf '  "tracked_changed_count": %s,\n' "$tracked_count"
+  printf '  "untracked_count": %s,\n' "$untracked_count"
+  printf '  "main_worktree_clean_after": %s,\n' "$main_clean_after"
+  printf '  "task_sha256": "%s",\n' "$(json_escape "$task_sha256")"
+  printf '  "task_length": %s,\n' "${#task_text}"
+  printf '  "sandbox": "%s",\n' "$(json_escape "$(cfg_get "$cfg" execution sandbox "workspace-write")")"
+  printf '  "auto_approve": %s,\n' "$auto_approve_val"
+  printf '  "codex_ds": "%s",\n' "$(json_escape "$codex_ds")"
+  printf '  "git_version": "%s"\n' "$(json_escape "$git_version")"
+  printf '}\n'
+} > "$metadata"
+chmod 600 "$metadata"
+
+# --- write TASK_RESULT.md -------------------------------------------------
+
+{
+  printf '# Task result: %s\n' "$task_id"
+  printf '\n'
+  printf 'Product: Codex Dual Engine Lite v%s\n' "$VERSION"
+  printf '\n'
+  printf '| field | value |\n'
+  printf '| --- | --- |\n'
+  printf '| model exit status | %s |\n' "$model_rc"
+  printf '| files changed | %s (%s files) |\n' "$files_changed" "$changed_count"
+  printf '| branch | %s |\n' "$branch"
+  printf '| head commit | %s |\n' "$head_commit"
+  printf '| worktree | %s |\n' "$worktree"
+  printf '| result directory | %s |\n' "$result_dir"
+  printf '\n'
+  printf '## Changed files\n'
+  printf '\n'
+  if [[ -n "$changed_files" ]]; then
+    printf '%s\n' "$changed_files" | sed 's/^/- `/; s/$/`/'
+  else
+    printf '_No files changed._\n'
+  fi
+  printf '\n'
+  printf '## Artifacts\n'
+  printf '\n'
+  printf -- '- `diff.patch` - complete untrusted patch against HEAD (tracked, staged, deleted, renamed, and untracked new files, including binary content)\n'
+  printf -- '- `changed-files.txt` - repository-relative changed/new paths\n'
+  printf -- '- `metadata.json` - non-secret operational facts\n'
+  printf -- '- `worker.log` - full worker and model log (mode 0600)\n'
+  printf -- '- `task.txt` - the original task text (mode 0600)\n'
+  printf '\n'
+  printf '## Review\n'
+  printf '\n'
+  printf 'Record the independent human/Sol verdict with:\n'
+  printf '\n'
+  printf '    deepseek-worker-review %s PASS|RETRY|TAKEOVER [note]\n' "$task_id"
+  printf '\n'
+  printf '## Cleanup\n'
+  printf '\n'
+  printf '    deepseek-worker-clean %s --yes\n' "$task_id"
+  printf '\n'
+} > "$result_dir/TASK_RESULT.md"
+chmod 600 "$result_dir/TASK_RESULT.md"
+
+say "result package written to $result_dir"
+say "model exit status: $model_rc; files changed: $files_changed ($changed_count)"
+say "task id: $task_id"
+
+if [[ "$main_clean_after" != "true" ]]; then
+  say "WARNING: main worktree is unexpectedly dirty after run"
+fi
+
+# The worker itself completed successfully regardless of the model's exit
+# status; both facts are recorded above.
+printf '%s\n' "$task_id"
+exit 0

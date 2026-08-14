@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Codex Dual Engine Lite - read-only diagnostics (macOS v0.1.0)
+#
+# Performs read-only checks for platform, required commands, Codex CLI
+# presence/version, configuration and directory permissions, Keychain item
+# availability, and repository readiness. It never reveals credentials.
+
+set -euo pipefail
+shopt -s extglob 2>/dev/null || true
+
+VERSION="0.1.0"
+PROGRAM="deepseek-worker-doctor"
+
+HOME="${HOME:-/tmp}"
+
+pass=0
+info=0
+warn=0
+fail=0
+
+ok() { printf '  [ok] %s\n' "$*"; pass=$((pass + 1)); }
+note() { printf ' [info] %s\n' "$*"; info=$((info + 1)); }
+warn() { printf ' [warn] %s\n' "$*"; warn=$((warn + 1)); }
+bad() { printf ' [FAIL] %s\n' "$*"; fail=$((fail + 1)); }
+
+data_home() {
+  local d="${CODEX_DUAL_ENGINE_LITE_HOME:-}"
+  if [[ -z "$d" ]]; then
+    d="$HOME/.local/share/codex-dual-engine-lite"
+  fi
+  printf '%s\n' "$d"
+}
+
+config_file() {
+  local c="${CODEX_DUAL_ENGINE_LITE_CONFIG:-}"
+  if [[ -z "$c" ]]; then
+    c="$(data_home)/config.toml"
+  fi
+  printf '%s\n' "$c"
+}
+
+cfg_get() {
+  local file="$1" section="$2" key="$3" default="${4:-}"
+  local cur="" line k v first last
+  [[ -f "$file" ]] || {
+    [[ -n "$default" ]] && { printf '%s\n' "$default"; return 0; }
+    return 1
+  }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line##+([[:space:]])}"
+    line="${line%%+([[:space:]])}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" =~ ^\[[[:space:]]*(.+)[[:space:]]*\]$ ]]; then
+      cur="${BASH_REMATCH[1]}"
+      cur="${cur##+([[:space:]])}"
+      cur="${cur%%+([[:space:]])}"
+      continue
+    fi
+    if [[ "$line" =~ ^([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"
+      v="${BASH_REMATCH[2]}"
+      if [[ "$cur" == "$section" && "$k" == "$key" ]]; then
+        first="${v:0:1}"
+        last="${v: -1}"
+        if [[ "$first" == '"' && "$last" == '"' ]]; then
+          v="${v:1:${#v}-2}"
+        elif [[ "$first" == "'" && "$last" == "'" ]]; then
+          v="${v:1:${#v}-2}"
+        fi
+        printf '%s\n' "$v"
+        return 0
+      fi
+    fi
+  done < "$file"
+  [[ -n "$default" ]] && { printf '%s\n' "$default"; return 0; }
+  return 1
+}
+
+perm_octal() {
+  local p="$1"
+  [[ -e "$p" ]] || { printf 'n/a\n'; return 0; }
+  if command -v stat >/dev/null 2>&1; then
+    stat -f '%Lp' "$p" 2>/dev/null || printf 'n/a\n'
+  else
+    printf 'n/a\n'
+  fi
+}
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+printf 'Codex Dual Engine Lite doctor v%s\n' "$VERSION"
+printf '\n'
+
+# --- platform -------------------------------------------------------------
+printf 'Platform\n'
+os_name=$(uname -s 2>/dev/null || printf 'unknown')
+if [[ "$os_name" == "Darwin" ]]; then
+  os_ver=$(sw_vers -productVersion 2>/dev/null || printf 'unknown')
+  ok "macOS detected (Darwin $os_ver)"
+else
+  warn "expected macOS (Darwin) but found '$os_name'; this is a macOS v0.1"
+fi
+
+bash_major=${BASH_VERSINFO[0]:-0}
+bash_minor=${BASH_VERSINFO[1]:-0}
+if ((bash_major > 3 || (bash_major == 3 && bash_minor >= 2))); then
+  ok "Bash version ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+else
+  warn "Bash ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]} may be too old; 3.2+ is expected"
+fi
+
+printf '\nRequired commands\n'
+missing=0
+for c in git security shasum grep sed awk mktemp dirname basename date od tr sort cut; do
+  if has_cmd "$c"; then
+    :
+  else
+    bad "missing required command: $c"
+    missing=$((missing + 1))
+  fi
+done
+if ((missing == 0)); then
+  ok "all required commands are present"
+fi
+
+printf '\nCodex CLI\n'
+if has_cmd codex; then
+  codex_ver=$(codex --version 2>&1 | grep -E -o '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)
+  if [[ -n "$codex_ver" ]]; then
+    ok "Codex CLI present (version $codex_ver)"
+  else
+    ok "Codex CLI present (version string not parsed)"
+  fi
+else
+  bad "Codex CLI not found on PATH"
+fi
+
+printf '\nConfiguration\n'
+cfg="$(config_file)"
+data="$(data_home)"
+if [[ -f "$cfg" ]]; then
+  cfg_perm=$(perm_octal "$cfg")
+  ok "config found: $cfg (mode $cfg_perm)"
+  case "$cfg_perm" in
+    600|400) ;;
+    *) warn "config mode $cfg_perm is not private; consider chmod 600" ;;
+  esac
+else
+  note "config not found at $cfg (copy config/config.example.toml there)"
+fi
+
+provider=$(cfg_get "$cfg" provider name "deepseek")
+model=$(cfg_get "$cfg" provider model "")
+if [[ -n "$model" && "$model" != "REPLACE_WITH_MODEL" ]]; then
+  ok "provider/model configured: $provider / $model"
+else
+  warn "provider.model is not configured (still '$model')"
+fi
+
+printf '\nData directory\n'
+if [[ -d "$data" ]]; then
+  data_perm=$(perm_octal "$data")
+  ok "data directory exists: $data (mode $data_perm)"
+  case "$data_perm" in
+    700) ;;
+    *) warn "data directory mode $data_perm is not 0700" ;;
+  esac
+else
+  note "data directory does not exist yet: $data (created on first run)"
+fi
+
+printf '\nKeychain\n'
+if has_cmd security; then
+  kc_service=$(cfg_get "$cfg" keychain service "codex-dual-engine-lite")
+  kc_account=$(cfg_get "$cfg" keychain account "deepseek-api-key")
+  if security find-generic-password -s "$kc_service" -a "$kc_account" >/dev/null 2>&1; then
+    ok "Keychain item present (service '$kc_service', account '$kc_account')"
+  else
+    warn "Keychain item not found for service '$kc_service', account '$kc_account'"
+  fi
+else
+  note "skipping Keychain check (security command unavailable)"
+fi
+
+printf '\nRepository readiness\n'
+if ! has_cmd git; then
+  note "skipping repository checks (git unavailable)"
+elif ! git rev-parse --git-dir >/dev/null 2>&1; then
+  note "current directory is not inside a Git repository"
+else
+  if [[ "$(git rev-parse --is-bare-repository 2>/dev/null)" == "true" ]]; then
+    bad "repository is bare"
+  else
+    ok "Git repository detected"
+  fi
+  if git rev-parse --verify HEAD >/dev/null 2>&1; then
+    ok "HEAD commit exists"
+  else
+    bad "no HEAD commit"
+  fi
+  dirty=$(git status --porcelain 2>/dev/null || true)
+  if [[ -z "$dirty" ]]; then
+    ok "working tree is clean"
+  else
+    warn "working tree is dirty (worker requires a clean repository)"
+  fi
+fi
+
+printf '\nSummary: %d ok, %d info, %d warn, %d fail\n' "$pass" "$info" "$warn" "$fail"
+if ((fail > 0)); then
+  exit 1
+fi
+exit 0

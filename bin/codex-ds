@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# Codex Dual Engine Lite - model entrypoint (macOS v0.1.0)
+#
+# Runs the Codex CLI non-interactively inside an isolated CODEX_HOME using a
+# command-backed macOS Keychain API key. The task prompt is read from stdin and
+# forwarded to `codex exec` on stdin so it never appears in a process argument
+# list.
+#
+# This program never writes the API key to disk and never prints it.
+
+set -euo pipefail
+shopt -s extglob 2>/dev/null || true
+
+VERSION="0.1.0"
+PROGRAM="codex-ds"
+
+die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit "${2:-1}"; }
+info() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; }
+
+HOME="${HOME:-/tmp}"
+
+# --- configuration lookup -------------------------------------------------
+
+data_home() {
+  local d="${CODEX_DUAL_ENGINE_LITE_HOME:-}"
+  if [[ -z "$d" ]]; then
+    d="$HOME/.local/share/codex-dual-engine-lite"
+  fi
+  printf '%s\n' "$d"
+}
+
+config_file() {
+  local c="${CODEX_DUAL_ENGINE_LITE_CONFIG:-}"
+  if [[ -z "$c" ]]; then
+    c="$(data_home)/config.toml"
+  fi
+  printf '%s\n' "$c"
+}
+
+cfg_get() {
+  # cfg_get <file> <section> <key> [default]
+  local file="$1" section="$2" key="$3" default="${4:-}"
+  local cur="" line k v first last
+  [[ -f "$file" ]] || {
+    [[ -n "$default" ]] && { printf '%s\n' "$default"; return 0; }
+    return 1
+  }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line##+([[:space:]])}"
+    line="${line%%+([[:space:]])}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" =~ ^\[[[:space:]]*(.+)[[:space:]]*\]$ ]]; then
+      cur="${BASH_REMATCH[1]}"
+      cur="${cur##+([[:space:]])}"
+      cur="${cur%%+([[:space:]])}"
+      continue
+    fi
+    if [[ "$line" =~ ^([A-Za-z0-9_.-]+)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"
+      v="${BASH_REMATCH[2]}"
+      if [[ "$cur" == "$section" && "$k" == "$key" ]]; then
+        first="${v:0:1}"
+        last="${v: -1}"
+        if [[ "$first" == '"' && "$last" == '"' ]]; then
+          v="${v:1:${#v}-2}"
+        elif [[ "$first" == "'" && "$last" == "'" ]]; then
+          v="${v:1:${#v}-2}"
+        fi
+        printf '%s\n' "$v"
+        return 0
+      fi
+    fi
+  done < "$file"
+  [[ -n "$default" ]] && { printf '%s\n' "$default"; return 0; }
+  return 1
+}
+
+toml_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s\n' "$s"
+}
+
+# --- argument parsing -----------------------------------------------------
+
+usage() {
+  cat >&2 <<'EOF'
+usage: codex-ds [OPTIONS]
+
+Reads a task prompt from stdin and runs the configured Codex CLI model inside
+an isolated CODEX_HOME. Intended to be invoked by deepseek-worker.
+
+options:
+  --help   show this help
+
+environment:
+  CODEX_DUAL_ENGINE_LITE_HOME       product data directory
+  CODEX_DUAL_ENGINE_LITE_CONFIG     path to config.toml
+  CODEX_DUAL_ENGINE_LITE_CODEX      path to the codex executable
+  CODEX_DUAL_ENGINE_LITE_TASK_ID    task id (set by deepseek-worker)
+EOF
+  exit 0
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage ;;
+    *) die "unexpected argument: $arg" 2 ;;
+  esac
+done
+
+# --- read and validate the prompt ----------------------------------------
+
+prompt=$(cat || true)
+if [[ -z "$prompt" ]]; then
+  die "no prompt supplied on stdin" 2
+fi
+if ((${#prompt} > 200000)); then
+  die "prompt exceeds the 200000 byte safety limit" 2
+fi
+
+# --- resolve configuration ------------------------------------------------
+
+cfg="$(config_file)"
+provider="${CODEX_DUAL_ENGINE_LITE_PROVIDER:-$(cfg_get "$cfg" provider name "deepseek")}"
+base_url="${CODEX_DUAL_ENGINE_LITE_BASE_URL:-$(cfg_get "$cfg" provider base_url "")}"
+model="${CODEX_DUAL_ENGINE_LITE_MODEL:-$(cfg_get "$cfg" provider model "")}"
+env_key="${CODEX_DUAL_ENGINE_LITE_ENV_KEY:-$(cfg_get "$cfg" provider env_key "DEEPSEEK_API_KEY")}"
+
+kc_service="${CODEX_DUAL_ENGINE_LITE_KEYCHAIN_SERVICE:-$(cfg_get "$cfg" keychain service "codex-dual-engine-lite")}"
+kc_account="${CODEX_DUAL_ENGINE_LITE_KEYCHAIN_ACCOUNT:-$(cfg_get "$cfg" keychain account "deepseek-api-key")}"
+
+sandbox="${CODEX_DUAL_ENGINE_LITE_SANDBOX:-$(cfg_get "$cfg" execution sandbox "workspace-write")}"
+auto_approve="${CODEX_DUAL_ENGINE_LITE_AUTO_APPROVE:-$(cfg_get "$cfg" execution auto_approve "false")}"
+
+if [[ -z "$base_url" || "$base_url" == "REPLACE_WITH_BASE_URL" ]]; then
+  die "provider.base_url is not configured; see config/config.example.toml" 1
+fi
+if [[ -z "$model" || "$model" == "REPLACE_WITH_MODEL" ]]; then
+  die "provider.model is not configured; set it in $cfg" 1
+fi
+if [[ ! "$env_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  die "provider.env_key is not a valid environment variable name" 1
+fi
+if [[ ! "$provider" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+  die "provider.name is not a safe identifier" 1
+fi
+
+case "$sandbox" in
+  read-only|workspace-write) ;;
+  danger-full-access)
+    die "sandbox 'danger-full-access' is not allowed by this tool" 1 ;;
+  *)
+    die "invalid execution.sandbox '$sandbox'; use read-only or workspace-write" 1 ;;
+esac
+
+case "$auto_approve" in
+  true|false) ;;
+  *) die "execution.auto_approve must be true or false" 1 ;;
+esac
+
+# --- Keychain-backed authentication --------------------------------------
+
+# Remove any inherited key so it cannot leak into the child process.
+unset DEEPSEEK_API_KEY 2>/dev/null || true
+unset "$env_key" 2>/dev/null || true
+
+if ! command -v security >/dev/null 2>&1; then
+  die "required command 'security' not found; macOS Keychain is unavailable" 1
+fi
+
+api_key=$(security find-generic-password -w -s "$kc_service" -a "$kc_account" 2>/dev/null || true)
+if [[ -z "$api_key" ]]; then
+  die "no Keychain item for service '$kc_service' account '$kc_account'; see README setup" 1
+fi
+
+# --- isolated CODEX_HOME --------------------------------------------------
+
+task_id="${CODEX_DUAL_ENGINE_LITE_TASK_ID:-}"
+if [[ -n "$task_id" ]]; then
+  codex_home="$(data_home)/tasks/$task_id/codex-home"
+else
+  codex_home="$(data_home)/codex-home"
+fi
+
+umask 077
+mkdir -p "$codex_home"
+chmod 700 "$codex_home" 2>/dev/null || true
+
+prov_esc=$(toml_escape "$provider")
+base_esc=$(toml_escape "$base_url")
+model_esc=$(toml_escape "$model")
+key_esc=$(toml_escape "$env_key")
+
+{
+  printf 'model = "%s"\n' "$model_esc"
+  printf 'model_provider = "%s"\n' "$prov_esc"
+  printf '\n[model_providers.%s]\n' "$provider"
+  printf 'name = "%s"\n' "$prov_esc"
+  printf 'base_url = "%s"\n' "$base_esc"
+  printf 'env_key = "%s"\n' "$key_esc"
+  printf 'wire_api = "chat"\n'
+} > "$codex_home/config.toml"
+chmod 600 "$codex_home/config.toml"
+
+# --- run Codex CLI --------------------------------------------------------
+
+codex_bin="${CODEX_DUAL_ENGINE_LITE_CODEX:-codex}"
+if ! command -v "$codex_bin" >/dev/null 2>&1 && [[ "$codex_bin" != */* ]]; then
+  die "Codex CLI executable not found on PATH" 1
+fi
+
+cwd="$(pwd -P)"
+
+args=()
+args+=(exec)
+args+=(--cd "$cwd")
+args+=(--sandbox "$sandbox")
+if [[ "$auto_approve" == "true" ]]; then
+  args+=(--approve-for-me)
+fi
+
+printf '%s\n' "$prompt" | (
+  export CODEX_HOME="$codex_home"
+  export "$env_key=$api_key"
+  exec "$codex_bin" "${args[@]}"
+)

@@ -1,0 +1,13 @@
+# Optional Codex CLI agent definition for the DeepSeek delegation workflow.
+#
+# This is a reference file and is NOT installed by default because custom
+# agent support varies by Codex CLI version. Validate the exact schema against
+# your installed Codex CLI before copying this into $CODEX_HOME/agents/.
+#
+# You can install it explicitly with:  install.sh --install-agent
+
+name: deepseek-delegation
+description: >-
+  Coordinate the safety-first DeepSeek delegation workflow: run a bounded
+  worker task in an isolated worktree, inspect the result package, record an
+  independent human/Sol review verdict, and clean up.
