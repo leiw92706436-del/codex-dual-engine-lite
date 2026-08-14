@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex Dual Engine Lite - model entrypoint (macOS v0.1.0)
+# Codex Dual Engine Lite - model entrypoint (macOS v0.2.0)
 #
 # Runs the Codex CLI non-interactively inside an isolated CODEX_HOME using a
 # command-backed macOS Keychain API key. The task prompt is read from stdin and
@@ -11,7 +11,7 @@
 set -euo pipefail
 shopt -s extglob 2>/dev/null || true
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="codex-ds"
 
 die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit "${2:-1}"; }
@@ -200,7 +200,7 @@ key_esc=$(toml_escape "$env_key")
   printf 'name = "%s"\n' "$prov_esc"
   printf 'base_url = "%s"\n' "$base_esc"
   printf 'env_key = "%s"\n' "$key_esc"
-  printf 'wire_api = "chat"\n'
+  printf 'wire_api = "responses"\n'
 } > "$codex_home/config.toml"
 chmod 600 "$codex_home/config.toml"
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex Dual Engine Lite - offline automated test suite (macOS v0.1.0)
+# Codex Dual Engine Lite - offline automated test suite (macOS v0.2.0)
 #
 # Runs entirely offline using a temporary HOME, data/config directory, and a
 # stub codex-ds. It never invokes a real model and never touches real state.
@@ -72,6 +72,12 @@ auto_approve = false
 
 [preflight]
 allowlist = ""
+
+[budgets]
+max_runtime_seconds = 1800
+max_log_bytes = 2000000
+max_changed_files = 100
+max_patch_bytes = 5000000
 EOF
 
 cat > "$STUB" <<'EOF'
@@ -92,6 +98,17 @@ if [[ -z "${CDE_STUB_NOCHANGE:-}" ]]; then
   if [[ -n "${CDE_STUB_BINARY:-}" ]]; then
     printf 'BIN\000\001\002STUFF\377\n' > stub-new-binary.bin
   fi
+fi
+if [[ -n "${CDE_STUB_OUTPUT_BYTES:-}" ]]; then
+  written=0
+  chunk='XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+  while ((written < CDE_STUB_OUTPUT_BYTES)); do
+    printf '%s\n' "$chunk"
+    written=$((written + ${#chunk} + 1))
+  done
+fi
+if [[ -n "${CDE_STUB_SLEEP_SECONDS:-}" ]]; then
+  sleep "$CDE_STUB_SLEEP_SECONDS"
 fi
 exit "${CDE_STUB_EXIT:-0}"
 EOF
@@ -122,6 +139,12 @@ reset_stub() {
   CDE_STUB_EXIT=""
   CDE_STUB_NOCHANGE=""
   CDE_STUB_BINARY=""
+  CDE_STUB_OUTPUT_BYTES=""
+  CDE_STUB_SLEEP_SECONDS=""
+  CDE_TEST_MAX_RUNTIME_SECONDS="1800"
+  CDE_TEST_MAX_LOG_BYTES="2000000"
+  CDE_TEST_MAX_CHANGED_FILES="100"
+  CDE_TEST_MAX_PATCH_BYTES="5000000"
 }
 
 run_worker() {
@@ -139,6 +162,12 @@ run_worker() {
     CDE_STUB_EXIT="${CDE_STUB_EXIT:-}" \
     CDE_STUB_NOCHANGE="${CDE_STUB_NOCHANGE:-}" \
     CDE_STUB_BINARY="${CDE_STUB_BINARY:-}" \
+    CDE_STUB_OUTPUT_BYTES="${CDE_STUB_OUTPUT_BYTES:-}" \
+    CDE_STUB_SLEEP_SECONDS="${CDE_STUB_SLEEP_SECONDS:-}" \
+    CODEX_DUAL_ENGINE_LITE_MAX_RUNTIME_SECONDS="$CDE_TEST_MAX_RUNTIME_SECONDS" \
+    CODEX_DUAL_ENGINE_LITE_MAX_LOG_BYTES="$CDE_TEST_MAX_LOG_BYTES" \
+    CODEX_DUAL_ENGINE_LITE_MAX_CHANGED_FILES="$CDE_TEST_MAX_CHANGED_FILES" \
+    CODEX_DUAL_ENGINE_LITE_MAX_PATCH_BYTES="$CDE_TEST_MAX_PATCH_BYTES" \
     "$REPO_ROOT/bin/deepseek-worker" "$task") 2>"$err_file" )
   WORKER_RC=$?
   WORKER_ERR=$(cat "$err_file")
@@ -187,6 +216,7 @@ test_successful_run() {
   assert "changed-files.txt exists" test -f "$result_dir/changed-files.txt"
   assert "diff.patch exists" test -f "$result_dir/diff.patch"
   assert "metadata.json exists" test -f "$result_dir/metadata.json"
+  assert "REVIEW_PACKET.json exists" test -f "$result_dir/REVIEW_PACKET.json"
   assert "worker.log exists" test -f "$result_dir/worker.log"
   assert "task.txt exists" test -f "$result_dir/task.txt"
 
@@ -201,9 +231,17 @@ test_successful_run() {
   assert_contains "TASK_RESULT describes complete untrusted patch" "$(cat "$result_dir/TASK_RESULT.md")" "complete untrusted patch"
   assert_contains "metadata records model exit 0" "$(cat "$result_dir/metadata.json")" '"model_exit_status": 0'
   assert_contains "metadata records files changed true" "$(cat "$result_dir/metadata.json")" '"files_changed": true'
+  assert_contains "review packet uses v1 schema" "$(cat "$result_dir/REVIEW_PACKET.json")" '"schema": "dual-engine-review.v1"'
+  assert_contains "review packet records no budget breach" "$(cat "$result_dir/REVIEW_PACKET.json")" '"exceeded": false'
+  assert_contains "review packet assigns conservative risk" "$(cat "$result_dir/REVIEW_PACKET.json")" '"level": "YELLOW"'
+  assert_contains "review packet requires reviewer validation" "$(cat "$result_dir/REVIEW_PACKET.json")" '"reviewer_validation": "NOT_RUN_BY_REVIEWER"'
+  local expected_patch_sha
+  expected_patch_sha=$(shasum -a 256 "$result_dir/diff.patch" | awk '{print $1}')
+  assert_contains "review packet patch hash matches artifact" "$(cat "$result_dir/REVIEW_PACKET.json")" "$expected_patch_sha"
   assert_contains "stub was invoked" "$(cat "$STUB_LOG" 2>/dev/null)" "STUB_INVOKED"
 
   assert_eq "worker.log is mode 0600" 600 "$(perm_octal "$result_dir/worker.log")"
+  assert_eq "review packet is mode 0600" 600 "$(perm_octal "$result_dir/REVIEW_PACKET.json")"
   assert_eq "result dir is mode 0700" 700 "$(perm_octal "$result_dir")"
   assert_eq "delegated worktree has no staged changes after patch generation" "" "$(git -C "$TEST_DATA/tasks/$task_id/worktree" diff --cached --name-only 2>/dev/null)"
 
@@ -224,7 +262,29 @@ test_successful_run() {
   assert_contains "worktree is registered" "$(git -C "$repo" worktree list --porcelain)" "worktree $wt_canon"
 }
 
-# --- 3. secret filename preflight ----------------------------------------
+# --- 3. live budget stop -------------------------------------------------
+
+test_log_budget_stop() {
+  local repo
+  repo=$(new_repo log-budget)
+  reset_stub
+  CDE_STUB_OUTPUT_BYTES=8192
+  CDE_STUB_SLEEP_SECONDS=10
+  CDE_TEST_MAX_LOG_BYTES=1024
+
+  run_worker "$repo" "produce enough output to trigger the log budget"
+  assert_eq "budget-stopped worker still returns a reviewable task id" 0 "$WORKER_RC"
+
+  local task_id="$WORKER_STDOUT"
+  local result_dir="$TEST_DATA/tasks/$task_id/result"
+  assert "budget stop still writes review packet" test -f "$result_dir/REVIEW_PACKET.json"
+  assert_contains "review packet records budget breach" "$(cat "$result_dir/REVIEW_PACKET.json")" '"exceeded": true'
+  assert_contains "review packet records log stop reason" "$(cat "$result_dir/REVIEW_PACKET.json")" 'log_size_limit_exceeded'
+  assert_not_contains "budget-stopped model cannot report exit zero" "$(cat "$result_dir/REVIEW_PACKET.json")" '"model_exit_status": 0'
+  assert_contains "private log records enforced stop" "$(cat "$result_dir/worker.log")" 'budget stop: log_size_limit_exceeded'
+}
+
+# --- 4. secret filename preflight ----------------------------------------
 
 test_secret_filename() {
   local repo
@@ -511,6 +571,7 @@ EOF
   assert_contains "keychain key injected into model env" "$(cat "$codexlog")" "env_key=FAKE-KEYCHAIN-SECRET"
   assert_not_contains "inherited DEEPSEEK_API_KEY is removed" "$(cat "$codexlog")" "PARENT-LEAKED"
   assert_contains "codex invoked with workspace-write sandbox" "$(cat "$codexlog")" "--sandbox workspace-write"
+  assert_contains "isolated provider uses supported Responses API" "$(cat "$data/tasks/testtask/codex-home/config.toml")" 'wire_api = "responses"'
   assert_not_contains "no approval/sandbox bypass flag" "$(cat "$codexlog")" "dangerously-bypass-approvals-and-sandbox"
   assert_not_contains "keychain secret not printed by codex-ds" "$out" "FAKE-KEYCHAIN-SECRET"
   assert_not_contains "parent key not printed by codex-ds" "$out" "PARENT-LEAKED"
@@ -552,6 +613,7 @@ printf 'temp dir:  %s\n\n' "$TEST_TMP"
 
 test_syntax
 test_successful_run
+test_log_budget_stop
 test_secret_filename
 test_secret_content
 test_placeholders_not_blocked

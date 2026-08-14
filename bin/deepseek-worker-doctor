@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex Dual Engine Lite - read-only diagnostics (macOS v0.1.0)
+# Codex Dual Engine Lite - read-only diagnostics (macOS v0.2.0)
 #
 # Performs read-only checks for platform, required commands, Codex CLI
 # presence/version, configuration and directory permissions, Keychain item
@@ -8,7 +8,7 @@
 set -euo pipefail
 shopt -s extglob 2>/dev/null || true
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="deepseek-worker-doctor"
 
 HOME="${HOME:-/tmp}"
@@ -98,7 +98,7 @@ if [[ "$os_name" == "Darwin" ]]; then
   os_ver=$(sw_vers -productVersion 2>/dev/null || printf 'unknown')
   ok "macOS detected (Darwin $os_ver)"
 else
-  warn "expected macOS (Darwin) but found '$os_name'; this is a macOS v0.1"
+  warn "expected macOS (Darwin) but found '$os_name'; this is a macOS v0.2"
 fi
 
 bash_major=${BASH_VERSINFO[0]:-0}

@@ -8,6 +8,6 @@
 
 name: deepseek-delegation
 description: >-
-  Coordinate the safety-first DeepSeek delegation workflow: run a bounded
-  worker task in an isolated worktree, inspect the result package, record an
-  independent human/Sol review verdict, and clean up.
+  Coordinate cost-bounded DeepSeek delegation: run one quiet task in an
+  isolated worktree, verify its fixed packet, apply risk-based independent
+  review, and record a verdict without merging.

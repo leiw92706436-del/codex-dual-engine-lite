@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex Dual Engine Lite - safe, idempotent installer (macOS v0.1.0)
+# Codex Dual Engine Lite - safe, idempotent installer (macOS v0.2.0)
 #
 # Installs the bundled CLI scripts and the delegation skill under safe,
 # configurable destinations. It never silently overwrites a modified file:
@@ -8,7 +8,7 @@
 set -euo pipefail
 shopt -s extglob 2>/dev/null || true
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="install.sh"
 
 die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit "${2:-1}"; }

@@ -1,6 +1,6 @@
 # Threat model
 
-This document describes the threat model for Codex Dual Engine Lite v0.1. The
+This document describes the threat model for Codex Dual Engine Lite v0.2. The
 trust boundary is between the local operator, the delegated model, repository
 content, the macOS Keychain, and the independent human/Sol reviewer.
 

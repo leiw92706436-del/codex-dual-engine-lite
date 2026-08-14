@@ -16,7 +16,7 @@ bounded DeepSeek V4 Pro worker  -->  isolated Git worktree
 result package + diff               independent Sol review
 ```
 
-This is a **v0.1 local implementation**. It is not a routing layer, a retry
+This is a **v0.2 local implementation**. It is not a routing layer, a retry
 manager, or a review automaton. It does not merge anything and does not claim
 to be production-hardened.
 
@@ -67,6 +67,7 @@ config/config.example.toml   example configuration (copy and edit)
 skills/deepseek-delegation/  Codex skill for the delegation workflow
 agents/openai.yaml           optional agent reference (not installed by default)
 docs/THREAT_MODEL.md         threat model
+docs/COST_CONTROL_AND_AB.md  cost controls and harness experiment protocol
 SECURITY.md                  security notes and reporting
 install.sh                   idempotent installer
 uninstall.sh                 removes only exact installed files
@@ -233,6 +234,7 @@ For a task id, the result directory contains:
 | `changed-files.txt` | repository-relative changed/new paths |
 | `diff.patch` | complete untrusted patch against HEAD: tracked, staged, deleted, renamed, and untracked new files (including binary content) |
 | `metadata.json` | non-secret operational facts |
+| `REVIEW_PACKET.json` | compact, locally computed review index and budget state |
 | `worker.log` | full worker and model log (mode 0600) |
 | `task.txt` | the original task text (mode 0600) |
 | `SOL_REVIEW.md` | review verdict, once recorded |
@@ -311,21 +313,30 @@ and untracked (including binary) files, and safe install/uninstall.
 
 ## Known limitations
 
-- macOS only (v0.1); no Windows/Linux hardening.
+- macOS only (v0.2); no Windows/Linux hardening.
 - The bundled TOML parser is minimal: full-line comments only, no inline
   comments or arrays.
 - `diff.patch` is a complete Git patch for tracked, staged, deleted, renamed,
   and untracked new files (including binary content), but remains untrusted
   model output. One edge case: an untracked symlink that points to a directory
   is listed in `changed-files.txt` but is not embedded in the patch.
-- The worker does not constrain model token usage or wall-clock time.
+- The worker cannot read an exact provider token counter in real time. Runtime
+  and private-log budgets therefore act as circuit breakers, while exact token
+  usage belongs in external A/B telemetry when available.
 - A same-user local process can generally observe this user's files and
   Keychain; the tool defends against path injection and operator error, not
   against an already-compromised account.
 
+## Cost control and Harness experiment
+
+See [docs/COST_CONTROL_AND_AB.md](docs/COST_CONTROL_AND_AB.md) for the quiet
+delegation protocol, fixed review packet, risk-based Sol review, budgets, and
+the controlled Codex CLI versus DeepSeek Harness experiment.
+
 ## Not implemented
 
 By design this repository does **not** include automatic task routing, a retry
-manager, a DeepSeek Harness, Claude Code integration, Luna integration,
-multi-provider A/B testing, a GUI, GitHub Actions, telemetry, package
-publishing, or remote publishing.
+manager, automatic merging, a production DeepSeek Harness integration, Claude
+Code integration, Luna integration, a GUI, GitHub Actions, telemetry, package
+publishing, or remote publishing. A bounded local Harness A/B is documented as
+an experiment, not a migration.

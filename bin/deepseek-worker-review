@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex Dual Engine Lite - review gate recorder (macOS v0.1.0)
+# Codex Dual Engine Lite - review gate recorder (macOS v0.2.0)
 #
 # Records an independent human/Sol verdict for an exact task id. This is a
 # recorder, not a fake reviewer: it validates inputs and writes SOL_REVIEW.md
@@ -9,7 +9,7 @@
 set -euo pipefail
 shopt -s extglob 2>/dev/null || true
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="deepseek-worker-review"
 
 die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit "${2:-1}"; }

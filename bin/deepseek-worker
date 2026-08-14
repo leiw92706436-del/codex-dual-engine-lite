@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex Dual Engine Lite - bounded worker (macOS v0.1.0)
+# Codex Dual Engine Lite - bounded worker (macOS v0.2.0)
 #
 # Accepts exactly one bounded task, requires a clean Git repository with a
 # HEAD, creates a uniquely named branch and a detached linked worktree under
@@ -12,7 +12,7 @@
 set -euo pipefail
 shopt -s extglob 2>/dev/null || true
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="deepseek-worker"
 
 die() { printf '%s: error: %s\n' "$PROGRAM" "$*" >&2; exit "${2:-1}"; }
@@ -84,6 +84,17 @@ json_escape() {
   s="${s//$'\r'/\\r}"
   s="${s//$'\t'/\\t}"
   printf '%s\n' "$s"
+}
+
+require_uint() {
+  local name="$1" value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer" 1
+}
+
+file_size() {
+  local path="$1"
+  [[ -f "$path" ]] || { printf '0\n'; return 0; }
+  wc -c < "$path" | tr -d ' '
 }
 
 valid_task_id() {
@@ -288,6 +299,16 @@ fi
 data="$(data_home)"
 cfg="$(config_file)"
 
+max_runtime_seconds="${CODEX_DUAL_ENGINE_LITE_MAX_RUNTIME_SECONDS:-$(cfg_get "$cfg" budgets max_runtime_seconds "1800")}"
+max_log_bytes="${CODEX_DUAL_ENGINE_LITE_MAX_LOG_BYTES:-$(cfg_get "$cfg" budgets max_log_bytes "2000000")}"
+max_changed_files="${CODEX_DUAL_ENGINE_LITE_MAX_CHANGED_FILES:-$(cfg_get "$cfg" budgets max_changed_files "100")}"
+max_patch_bytes="${CODEX_DUAL_ENGINE_LITE_MAX_PATCH_BYTES:-$(cfg_get "$cfg" budgets max_patch_bytes "5000000")}"
+
+require_uint "budgets.max_runtime_seconds" "$max_runtime_seconds"
+require_uint "budgets.max_log_bytes" "$max_log_bytes"
+require_uint "budgets.max_changed_files" "$max_changed_files"
+require_uint "budgets.max_patch_bytes" "$max_patch_bytes"
+
 if [[ "$data" != /* ]]; then
   die "data directory must be an absolute path: $data" 1
 fi
@@ -412,13 +433,52 @@ started_at=$(now)
 say "invoking $codex_ds in worktree"
 
 model_rc=0
-cd "$worktree"
-if printf '%s\n' "$task_text" | "$codex_ds" >>"$logfile" 2>&1; then
+budget_stop_reason=""
+start_epoch=$(date +%s)
+
+# Keep the model transcript private. Only the worker's short status lines reach
+# the caller; model output, commands, tests, and diffs stay in worker.log. Job
+# control gives the background launch its own process group so a budget stop
+# terminates Codex and every descendant instead of leaving an orphaned request.
+set -m
+(
+  cd "$worktree"
+  exec "$codex_ds" < "$result_dir/task.txt"
+) >>"$logfile" 2>&1 &
+model_pid=$!
+set +m
+
+while kill -0 "$model_pid" 2>/dev/null; do
+  sleep 1
+  current_epoch=$(date +%s)
+  elapsed_seconds=$((current_epoch - start_epoch))
+  current_log_bytes=$(file_size "$logfile")
+
+  if ((max_runtime_seconds > 0 && elapsed_seconds >= max_runtime_seconds)); then
+    budget_stop_reason="runtime_limit_exceeded"
+  elif ((max_log_bytes > 0 && current_log_bytes >= max_log_bytes)); then
+    budget_stop_reason="log_size_limit_exceeded"
+  fi
+
+  if [[ -n "$budget_stop_reason" ]]; then
+    log "budget stop: $budget_stop_reason"
+    kill -TERM -- "-$model_pid" 2>/dev/null || kill -TERM "$model_pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$model_pid" 2>/dev/null || break
+      sleep 1
+    done
+    if kill -0 "$model_pid" 2>/dev/null; then
+      kill -KILL -- "-$model_pid" 2>/dev/null || kill -KILL "$model_pid" 2>/dev/null || true
+    fi
+    break
+  fi
+done
+
+if wait "$model_pid"; then
   model_rc=0
 else
   model_rc=$?
 fi
-cd "$repo_root"
 finished_at=$(now)
 
 log "model exit status: $model_rc"
@@ -460,6 +520,58 @@ fi
 printf '%s\n' "$changed_files" > "$result_dir/changed-files.txt"
 chmod 600 "$result_dir/diff.patch" "$result_dir/changed-files.txt"
 
+patch_bytes=$(file_size "$result_dir/diff.patch")
+patch_sha256=$(shasum -a 256 "$result_dir/diff.patch" | awk '{print $1}')
+log_bytes=$(file_size "$logfile")
+
+if ((max_changed_files > 0 && changed_count > max_changed_files)); then
+  if [[ -n "$budget_stop_reason" ]]; then
+    budget_stop_reason="$budget_stop_reason,changed_file_limit_exceeded"
+  else
+    budget_stop_reason="changed_file_limit_exceeded"
+  fi
+fi
+if ((max_patch_bytes > 0 && patch_bytes > max_patch_bytes)); then
+  if [[ -n "$budget_stop_reason" ]]; then
+    budget_stop_reason="$budget_stop_reason,patch_size_limit_exceeded"
+  else
+    budget_stop_reason="patch_size_limit_exceeded"
+  fi
+fi
+
+budget_exceeded=false
+[[ -n "$budget_stop_reason" ]] && budget_exceeded=true
+
+# Conservative, local risk classification. It controls review depth only and
+# can never approve a task.
+risk_level="GREEN"
+risk_reason="documentation_or_tests_only"
+while IFS= read -r rel; do
+  [[ -z "$rel" ]] && continue
+  rel_lower=$(lowercase "$rel")
+  case "$rel_lower" in
+    bin/*|config/*|.github/*|install.sh|uninstall.sh|*.sh|*auth*|*credential*|*secret*|*security*|*permission*|*network*)
+      risk_level="RED"
+      risk_reason="security_or_execution_surface_changed"
+      break
+      ;;
+    readme.md|license|security.md|docs/*|tests/*|*.md)
+      ;;
+    *)
+      if [[ "$risk_level" != "RED" ]]; then
+        risk_level="YELLOW"
+        risk_reason="application_logic_changed"
+      fi
+      ;;
+  esac
+done <<< "$changed_files"
+
+case "$risk_level" in
+  GREEN) recommended_review="local_checks_and_sampled_hunks" ;;
+  YELLOW) recommended_review="all_changed_hunks_and_relevant_tests" ;;
+  RED) recommended_review="all_security_critical_hunks_and_independent_validation" ;;
+esac
+
 main_dirty_after=$(git -C "$repo_root" status --porcelain 2>/dev/null || true)
 main_clean_after=false
 [[ -z "$main_dirty_after" ]] && main_clean_after=true
@@ -487,6 +599,8 @@ metadata="$result_dir/metadata.json"
   printf '  "started_at": "%s",\n' "$(json_escape "$started_at")"
   printf '  "finished_at": "%s",\n' "$(json_escape "$finished_at")"
   printf '  "model_exit_status": %s,\n' "$model_rc"
+  printf '  "budget_exceeded": %s,\n' "$budget_exceeded"
+  printf '  "budget_stop_reason": "%s",\n' "$(json_escape "$budget_stop_reason")"
   printf '  "files_changed": %s,\n' "$files_changed"
   printf '  "changed_file_count": %s,\n' "$changed_count"
   printf '  "tracked_changed_count": %s,\n' "$tracked_count"
@@ -502,6 +616,38 @@ metadata="$result_dir/metadata.json"
 } > "$metadata"
 chmod 600 "$metadata"
 
+review_packet="$result_dir/REVIEW_PACKET.json"
+{
+  printf '{\n'
+  printf '  "schema": "dual-engine-review.v1",\n'
+  printf '  "engine": "codex-cli",\n'
+  printf '  "task_id": "%s",\n' "$(json_escape "$task_id")"
+  printf '  "base_commit": "%s",\n' "$(json_escape "$head_commit")"
+  printf '  "model_exit_status": %s,\n' "$model_rc"
+  printf '  "files_changed": %s,\n' "$files_changed"
+  printf '  "changed_file_count": %s,\n' "$changed_count"
+  printf '  "patch_bytes": %s,\n' "$patch_bytes"
+  printf '  "patch_sha256": "%s",\n' "$(json_escape "$patch_sha256")"
+  printf '  "private_log_bytes": %s,\n' "$log_bytes"
+  printf '  "main_worktree_clean_after": %s,\n' "$main_clean_after"
+  printf '  "budget": {\n'
+  printf '    "max_runtime_seconds": %s,\n' "$max_runtime_seconds"
+  printf '    "max_log_bytes": %s,\n' "$max_log_bytes"
+  printf '    "max_changed_files": %s,\n' "$max_changed_files"
+  printf '    "max_patch_bytes": %s,\n' "$max_patch_bytes"
+  printf '    "exceeded": %s,\n' "$budget_exceeded"
+  printf '    "stop_reason": "%s"\n' "$(json_escape "$budget_stop_reason")"
+  printf '  },\n'
+  printf '  "risk": {\n'
+  printf '    "level": "%s",\n' "$risk_level"
+  printf '    "reason": "%s",\n' "$(json_escape "$risk_reason")"
+  printf '    "recommended_review": "%s"\n' "$recommended_review"
+  printf '  },\n'
+  printf '  "reviewer_validation": "NOT_RUN_BY_REVIEWER"\n'
+  printf '}\n'
+} > "$review_packet"
+chmod 600 "$review_packet"
+
 # --- write TASK_RESULT.md -------------------------------------------------
 
 {
@@ -513,6 +659,8 @@ chmod 600 "$metadata"
   printf '| --- | --- |\n'
   printf '| model exit status | %s |\n' "$model_rc"
   printf '| files changed | %s (%s files) |\n' "$files_changed" "$changed_count"
+  printf '| budget exceeded | %s |\n' "$budget_exceeded"
+  printf '| risk level | %s |\n' "$risk_level"
   printf '| branch | %s |\n' "$branch"
   printf '| head commit | %s |\n' "$head_commit"
   printf '| worktree | %s |\n' "$worktree"
@@ -531,6 +679,7 @@ chmod 600 "$metadata"
   printf -- '- `diff.patch` - complete untrusted patch against HEAD (tracked, staged, deleted, renamed, and untracked new files, including binary content)\n'
   printf -- '- `changed-files.txt` - repository-relative changed/new paths\n'
   printf -- '- `metadata.json` - non-secret operational facts\n'
+  printf -- '- `REVIEW_PACKET.json` - compact locally computed review index, risk, and budget state\n'
   printf -- '- `worker.log` - full worker and model log (mode 0600)\n'
   printf -- '- `task.txt` - the original task text (mode 0600)\n'
   printf '\n'

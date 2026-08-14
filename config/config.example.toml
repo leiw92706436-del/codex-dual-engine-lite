@@ -39,3 +39,11 @@ auto_approve = false
 # Comma-separated shell-style globs matched against repository-relative paths
 # and file basenames. Example: "docs/example.pem,fixtures/*.key"
 allowlist = ""
+
+[budgets]
+# Operational circuit breakers. Set an individual value to 0 to disable it.
+# These are elapsed-time/log/patch proxies, not an exact provider token meter.
+max_runtime_seconds = 1800
+max_log_bytes = 2000000
+max_changed_files = 100
+max_patch_bytes = 5000000
