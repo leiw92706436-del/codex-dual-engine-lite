@@ -16,9 +16,9 @@ bounded DeepSeek V4 Pro worker  -->  isolated Git worktree
 result package + diff               independent Sol review
 ```
 
-This is a **v0.2 local implementation**. It is not a routing layer, a retry
-manager, or a review automaton. It does not merge anything and does not claim
-to be production-hardened.
+This is a **v0.2 local implementation**. It is not a routing layer or review
+automaton. It supports exactly one reviewed, delta-only retry, does not merge
+anything, and does not claim to be production-hardened.
 
 ## What it does and does not do
 
@@ -32,6 +32,8 @@ It does:
 - record an independent human/Sol review verdict as a separate action, with a
   fail-closed PASS gate that verifies the local result invariants before
   recording `PASS`;
+- prepare and execute at most one reviewed correction, preserving complete
+  before/after patches and a locally reconstructed retry-only delta;
 - clean up only the managed worktree and branch while preserving results.
 
 It does **not**:
@@ -40,8 +42,8 @@ It does **not**:
 - modify the caller's main worktree;
 - use `danger-full-access` or
   `--dangerously-bypass-approvals-and-sandbox`;
-- route tasks automatically, retry failed tasks, perform automatic Sol
-  reasoning, or merge on approval;
+- route tasks automatically, retry without an explicit Sol verdict, perform
+  automatic Sol reasoning, or merge on approval;
 - publish anything remotely or ship telemetry.
 
 ## Compatibility
@@ -63,6 +65,7 @@ bin/                         shipped CLI scripts
   codex-ds                   model entrypoint (isolated CODEX_HOME + Keychain)
   deepseek-worker            bounded task -> isolated worktree -> result package
   deepseek-worker-review     records PASS|RETRY|TAKEOVER
+  deepseek-worker-retry      prepares and executes one reviewed delta-only retry
   deepseek-worker-clean      removes only the managed worktree and branch
   deepseek-worker-doctor     read-only diagnostics
 config/config.example.toml   example configuration (copy and edit)
@@ -217,10 +220,22 @@ emitted.
    ```
 
    - `PASS`: acceptable to apply manually.
-   - `RETRY`: re-run with a refined task.
+   - `RETRY`: permit one bounded correction in the existing isolated worktree.
    - `TAKEOVER`: a human takes over.
 
    `PASS` is fail-closed; see the PASS gate section below.
+
+   For one reviewed correction, write only the failing criterion and required
+   delta to a local file, then run:
+
+   ```sh
+   deepseek-worker-retry prepare TASK_ID --task-file correction.txt
+   deepseek-worker-retry execute TASK_ID
+   ```
+
+   Inspect `result/retry/attempt-1/EXECUTION.json` first. If it is `COMPLETE`,
+   review `delta-files.txt` and `delta.patch`, rerun the affected validation,
+   and record the final `PASS` or `TAKEOVER`. A second retry is refused.
 
 5. Clean up the managed worktree and branch (results are preserved):
 
@@ -242,6 +257,11 @@ For a task id, the result directory contains:
 | `worker.log` | full worker and model log (mode 0600) |
 | `task.txt` | the original task text (mode 0600) |
 | `SOL_REVIEW.md` | review verdict, once recorded |
+
+A prepared retry stores `task.txt`, `before.patch`, `before-files.txt`, and
+`PREPARED.json` under `retry/attempt-1/`. Execution adds private `retry.log`,
+`EXECUTION.json`, the complete `after.patch`/`after-files.txt`, and the
+retry-only `delta.patch`/`delta-files.txt`.
 
 The model exit status and the "files changed" flag are recorded separately; a
 failed model run can still produce (or not produce) file changes, and both
@@ -266,9 +286,16 @@ not create or modify `SOL_REVIEW.md`) unless all of the following hold:
   worktree, and is currently clean.
 
 Missing, malformed, duplicate, or ambiguous required JSON fields fail closed.
+For a final PASS after RETRY, the gate instead requires a canonical prior
+RETRY verdict and a complete successful retry package. It strictly parses
+`PREPARED.json` and `EXECUTION.json`, recomputes hashes/counts, confirms the
+source repository is still clean, byte-compares the current isolated
+worktree with `after.patch`, and independently reconstructs the before-to-after
+delta before accepting `delta.patch`. A second RETRY is refused.
+
 The recorder checks these local invariants; it does not reason about whether
-the code change is correct or safe to apply. `RETRY` and `TAKEOVER` remain
-recordable for failed or incomplete tasks.
+the code change is correct or safe to apply. `TAKEOVER` remains recordable for
+failed or incomplete tasks.
 
 ## Secret preflight
 
@@ -339,7 +366,8 @@ preflight (including runtime-generated PEM and PGP private-key markers and a
 shipped-tree self-scan with no allowlist), placeholder non-blocking,
 dirty-repository rejection, model exit-vs-changes distinction, review
 validation and traversal defense, cleanup validation and result preservation,
-fail-closed PASS-gate coverage (positive and negative cases), complete
+fail-closed original and retry PASS-gate coverage (including forged delta and
+post-execution drift cases), one bounded retry with runtime/log stops, complete
 `diff.patch` capture for tracked and untracked (including binary) files, and
 safe install/uninstall.
 
@@ -367,8 +395,9 @@ the controlled Codex CLI versus DeepSeek Harness experiment.
 
 ## Not implemented
 
-By design this repository does **not** include automatic task routing, a retry
-manager, automatic merging, a production DeepSeek Harness integration, Claude
-Code integration, Luna integration, a GUI, GitHub Actions, telemetry, package
+By design this repository does **not** include automatic task routing,
+automatic or multi-attempt retry orchestration, automatic merging, a
+production DeepSeek Harness integration, Claude Code integration, Luna
+integration, a GUI, GitHub Actions, telemetry, package
 publishing, or remote publishing. A bounded local Harness A/B is documented as
 an experiment, not a migration.

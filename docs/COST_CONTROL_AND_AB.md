@@ -83,6 +83,26 @@ Every completed worker run writes `REVIEW_PACKET.json` with a stable schema:
 The packet must never contain credentials, model reasoning, source-code
 contents, or full test logs.
 
+## One controlled retry
+
+A RETRY verdict permits exactly one correction in the existing isolated
+worktree. The correction file must contain only the failed acceptance
+criterion and required delta:
+
+```sh
+deepseek-worker-retry prepare TASK_ID --task-file correction.txt
+deepseek-worker-retry execute TASK_ID
+```
+
+Preparation never invokes a model. Execution uses a fixed concise response
+contract plus independent runtime/log circuit breakers. It publishes a private
+`EXECUTION.json`, complete `after.patch`, and a locally reconstructed
+`delta.patch`. Sol reads the execution packet first, then reviews only the
+delta and reruns the previously failing validation. Final PASS independently
+reconstructs both the current after-state and before-to-after delta. Failed,
+stopped, incomplete, drifted, or tampered retry packages fail closed; a second
+RETRY is refused.
+
 ## DeepSeek Harness experiment
 
 DeepSeek Harness remains an experiment while it is in developer preview. Do
@@ -138,3 +158,18 @@ to catch the out-of-scope generated files in both implementations.
   later Harness release adds a reliable total-task token budget or materially
   changes context behavior.
 - Keep Harness as an explicit, isolated experiment only.
+
+## Follow-up bounded implementation result (2026-08-15)
+
+Three narrowly scoped Codex CLI/V4 implementation tasks were each capped at
+300 seconds and one changed file. All three hit the runtime limit, but left
+useful partial code: retry execution core, test helpers, and snapshot/delta
+helpers. Sol accepted no run as PASS, reviewed the complete changed file once,
+recorded TAKEOVER, completed the missing parts, and ran the independent suite.
+
+This shows that the fixed packet and takeover path save review attention, but
+also that Codex CLI/V4 still has a long task loop even with tight file scope.
+Do not automatically increase time or retry the same prompt. Prefer smaller
+implementation-only tasks, retain the five-minute circuit breaker, and let Sol
+take over when the partial result is structurally useful. The completed local
+suite now has 276 passing checks, including retry install/uninstall coverage.

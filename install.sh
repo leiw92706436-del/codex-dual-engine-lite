@@ -137,6 +137,7 @@ install_one bin "$REPO_ROOT/bin/codex-ds" "$bin_dir/codex-ds" 0755
 install_one bin "$REPO_ROOT/bin/deepseek-worker" "$bin_dir/deepseek-worker" 0755
 install_one bin "$REPO_ROOT/bin/deepseek-worker-clean" "$bin_dir/deepseek-worker-clean" 0755
 install_one bin "$REPO_ROOT/bin/deepseek-worker-review" "$bin_dir/deepseek-worker-review" 0755
+install_one bin "$REPO_ROOT/bin/deepseek-worker-retry" "$bin_dir/deepseek-worker-retry" 0755
 install_one bin "$REPO_ROOT/bin/deepseek-worker-doctor" "$bin_dir/deepseek-worker-doctor" 0755
 install_one skill "$REPO_ROOT/skills/deepseek-delegation/SKILL.md" "$skills_dir/deepseek-delegation/SKILL.md" 0644
 

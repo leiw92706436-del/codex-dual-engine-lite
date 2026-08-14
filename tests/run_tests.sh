@@ -1128,6 +1128,7 @@ test_install_uninstall() {
   env "${envs[@]}" "$REPO_ROOT/install.sh" --prefix "$prefix" --install-agent >/dev/null 2>&1
   assert_eq "install succeeds" 0 "$?"
   assert "bin script installed and executable" test -x "$bin_dir/deepseek-worker"
+  assert "retry script installed and executable" test -x "$bin_dir/deepseek-worker-retry"
   assert "skill installed" test -f "$icodex/skills/deepseek-delegation/SKILL.md"
   assert "agent installed" test -f "$icodex/agents/openai.yaml"
   assert "example config created" test -f "$idata/config.toml"
@@ -1152,6 +1153,7 @@ test_install_uninstall() {
   env "${envs[@]}" "$REPO_ROOT/uninstall.sh" --prefix "$prefix" >/dev/null 2>&1
   assert_eq "uninstall succeeds" 0 "$?"
   assert "bin script removed" test ! -e "$bin_dir/deepseek-worker"
+  assert "retry script removed" test ! -e "$bin_dir/deepseek-worker-retry"
   assert "skill removed" test ! -e "$icodex/skills/deepseek-delegation/SKILL.md"
   assert "agent removed" test ! -e "$icodex/agents/openai.yaml"
   assert "manifest removed" test ! -e "$idata/install-manifest.tsv"

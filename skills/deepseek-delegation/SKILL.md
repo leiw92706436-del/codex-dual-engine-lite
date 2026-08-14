@@ -1,6 +1,6 @@
 ---
 name: deepseek-delegation
-description: Delegate one bounded coding task to the existing DeepSeek V4 Pro worker in an isolated Git worktree, then perform a cost-bounded independent Codex/Sol review without merging. Use only when the user explicitly asks for DeepSeek, V4 Pro, Dual Engine B-lite, or this skill. Do not use for automatic routing, secrets, production writes, destructive actions, or unclear requirements.
+description: Delegate one bounded coding task to the existing DeepSeek V4 Pro worker in an isolated Git worktree, perform a cost-bounded independent Codex/Sol review, and optionally execute exactly one reviewed delta-only retry without merging. Use only when the user explicitly asks for DeepSeek, V4 Pro, Dual Engine B-lite, or this skill. Do not use for automatic routing, secrets, production writes, destructive actions, or unclear requirements.
 ---
 
 # DeepSeek Delegation
@@ -110,8 +110,22 @@ deepseek-worker-review TASK_ID PASS|RETRY|TAKEOVER "short evidence-based note"
 
 For `RETRY`, allow at most one delta-only correction. State the failing
 acceptance criterion and implicated files; do not resend the full transcript
-or ask for a broad reimplementation. Review only the new delta plus any
-previously failing validation. If it still fails, use `TAKEOVER`.
+or ask for a broad reimplementation. Put that correction in a private local
+file, then run exactly:
+
+```sh
+deepseek-worker-retry prepare TASK_ID --task-file CORRECTION_FILE
+deepseek-worker-retry execute TASK_ID
+```
+
+The execute step is quiet and budgeted. Read `EXECUTION.json` first. Stop with
+`TAKEOVER` if it is missing, malformed, not `COMPLETE`, reports a nonzero
+runner exit, or reports a budget stop. Otherwise verify its hashes and counts,
+inspect only `delta.patch` and `delta-files.txt`, and rerun only the previously
+failing validation. Record final `PASS` with `deepseek-worker-review`; its
+fail-closed gate independently reconstructs the current after-state and retry
+delta. Never run a second retry. If the correction still fails, use
+`TAKEOVER`.
 
 Report a compact final summary: task ID, risk level, changed files, validation,
 findings, verdict, and next action.

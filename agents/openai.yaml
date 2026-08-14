@@ -10,4 +10,5 @@ name: deepseek-delegation
 description: >-
   Coordinate cost-bounded DeepSeek delegation: run one quiet task in an
   isolated worktree, verify its fixed packet, apply risk-based independent
-  review, and record a verdict without merging.
+  review, optionally run one reviewed delta-only retry, and record a verdict
+  without merging.

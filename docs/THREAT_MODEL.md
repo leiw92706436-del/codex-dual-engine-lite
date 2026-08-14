@@ -143,6 +143,10 @@ Mitigations:
 - Review recording is a separate command with an explicit verdict.
 - A PASS verdict is not based on the delegated model's self-assessment: it
   locally recomputes structural and safety invariants from the result package.
+- One explicit RETRY is isolated in the same managed worktree. Final PASS
+  requires a successful private execution package and independently
+  reconstructs both the current after-state and the retry-only delta; a second
+  RETRY is refused.
 - The tool does not claim to perform automatic Sol reasoning or merging.
 
 Residual risk: the locally computed structural and safety checks do not

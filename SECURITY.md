@@ -59,7 +59,8 @@ The main classes are:
 
 - Keep the product data directory private (`chmod 700`). It contains result
   packages and logs.
-- Treat `diff.patch` and any model-produced files as untrusted input. The
+- Treat `diff.patch`, retry `after.patch`/`delta.patch`, and any model-produced
+  files as untrusted input. The
   patch is intended to be complete (tracked, staged, deleted, renamed, and
   untracked new files, including binary content), but completeness does not
   make it safe to apply.
