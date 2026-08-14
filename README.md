@@ -285,7 +285,9 @@ keys, Slack tokens, and npm access tokens.
 Diagnostics show only the repository-relative filename and rule name; they
 never echo matching values or full matching lines. A narrowly scoped allowlist
 is available via `[preflight] allowlist` (comma-separated globs matched against
-repository-relative paths and basenames).
+repository-relative paths and basenames). PEM and PGP private-key block markers
+are assembled at runtime so the shipped worker does not contain the literal
+signatures that this same preflight must block.
 
 ## Doctor
 
@@ -333,11 +335,13 @@ bash tests/run_tests.sh
 ```
 
 It covers script syntax, a successful isolated run, secret filename/content
-preflight, placeholder non-blocking, dirty-repository rejection, model
-exit-vs-changes distinction, review validation and traversal defense, cleanup
-validation and result preservation, fail-closed PASS-gate coverage (positive
-and negative cases), complete `diff.patch` capture for tracked and untracked
-(including binary) files, and safe install/uninstall.
+preflight (including runtime-generated PEM and PGP private-key markers and a
+shipped-tree self-scan with no allowlist), placeholder non-blocking,
+dirty-repository rejection, model exit-vs-changes distinction, review
+validation and traversal defense, cleanup validation and result preservation,
+fail-closed PASS-gate coverage (positive and negative cases), complete
+`diff.patch` capture for tracked and untracked (including binary) files, and
+safe install/uninstall.
 
 ## Known limitations
 

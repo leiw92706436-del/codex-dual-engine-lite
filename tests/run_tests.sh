@@ -134,6 +134,31 @@ new_repo() {
   printf '%s\n' "$repo"
 }
 
+new_tracked_tree_repo() {
+  local name="$1"
+  local repo="$TEST_TMP/repos/$name"
+  local rel dir
+  case "$repo" in
+    "$TEST_TMP"/*) ;;
+    *) printf 'fatal: unsafe repo path\n' >&2; exit 1 ;;
+  esac
+  rm -rf -- "$repo"
+  mkdir -p "$repo"
+  while IFS= read -r -d '' rel; do
+    [[ -z "$rel" ]] && continue
+    dir=$(dirname "$rel")
+    [[ -d "$repo/$dir" ]] || mkdir -p "$repo/$dir"
+    cp -p "$REPO_ROOT/$rel" "$repo/$rel"
+  done < <(git -C "$REPO_ROOT" ls-files -z)
+  git -C "$repo" init -q
+  git -C "$repo" config user.name "CodexTest"
+  git -C "$repo" config user.email "test@example.invalid"
+  git -C "$repo" config commit.gpgsign false
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm "shipped tracked tree"
+  printf '%s\n' "$repo"
+}
+
 reset_stub() {
   : > "$STUB_LOG"
   CDE_STUB_EXIT=""
@@ -344,6 +369,19 @@ test_log_budget_stop() {
   assert_contains "private log records enforced stop" "$(cat "$result_dir/worker.log")" 'budget stop: log_size_limit_exceeded'
 }
 
+# --- 3.5 shipped tracked tree self-scan ----------------------------------
+
+test_shipped_tree_no_secret_self_trigger() {
+  local repo
+  repo=$(new_tracked_tree_repo self-scan)
+  reset_stub
+  CDE_STUB_NOCHANGE=1
+
+  run_worker "$repo" "verify the clean tracked tree passes secret preflight"
+  assert_eq "clean shipped tracked tree passes preflight without allowlist" 0 "$WORKER_RC"
+  assert_contains "preflight did not block the self-scan model invocation" "$(cat "$STUB_LOG" 2>/dev/null)" "STUB_INVOKED"
+}
+
 # --- 4. secret filename preflight ----------------------------------------
 
 test_secret_filename() {
@@ -372,10 +410,13 @@ test_secret_content() {
   repo=$(new_repo secret-content)
   mkdir -p "$repo/docs"
   local secret_body="MIIEpQIBAAKCAQEA0123456789abcdef0123456789abcdefSECRETKEYBODY"
+  local pem_begin="-----BEGIN"
+  local pem_suffix="PRIVATE KEY-----"
+  local pem_end_begin="-----END"
   {
-    printf '%s\n' '-----BEGIN RSA PRIVATE KEY-----'
+    printf '%s\n' "${pem_begin} RSA ${pem_suffix}"
     printf '%s\n' "$secret_body"
-    printf '%s\n' '-----END RSA PRIVATE KEY-----'
+    printf '%s\n' "${pem_end_begin} RSA ${pem_suffix}"
   } > "$repo/docs/notes.txt"
   git -C "$repo" add -A
   git -C "$repo" commit -qm "add private key in docs"
@@ -390,6 +431,33 @@ $WORKER_ERR"
   assert_contains "diagnostics name the content rule" "$combined" "content:pem-private-key"
   assert_not_contains "diagnostics do not leak the key body" "$combined" "$secret_body"
   assert_eq "stub model was not invoked" "" "$(cat "$STUB_LOG" 2>/dev/null)"
+}
+
+test_secret_pgp_content() {
+  local repo
+  repo=$(new_repo secret-pgp-content)
+  mkdir -p "$repo/docs"
+  local pgp_begin="-----BEGIN PGP"
+  local pgp_suffix="PRIVATE KEY BLOCK-----"
+  local pgp_end_begin="-----END PGP"
+  {
+    printf '%s\n' "${pgp_begin} ${pgp_suffix}"
+    printf '%s\n' "Version: Test"
+    printf '%s\n' "${pgp_end_begin} ${pgp_suffix}"
+  } > "$repo/docs/notes.txt"
+  git -C "$repo" add -A
+  git -C "$repo" commit -qm "add pgp private key in docs"
+  reset_stub
+
+  run_worker "$repo" "please do something"
+  assert_eq "PGP secret content preflight blocks before model" 4 "$WORKER_RC"
+
+  local combined="$WORKER_STDOUT
+$WORKER_ERR"
+  assert_contains "diagnostics name the blocked PGP file" "$combined" "docs/notes.txt"
+  assert_contains "diagnostics name the PGP content rule" "$combined" "content:pgp-private-key"
+  assert_not_contains "diagnostics do not leak the PGP fixture body" "$combined" "Version: Test"
+  assert_eq "stub model was not invoked for PGP" "" "$(cat "$STUB_LOG" 2>/dev/null)"
 }
 
 # --- 5. placeholders are not falsely blocked -----------------------------
@@ -778,8 +846,10 @@ printf 'temp dir:  %s\n\n' "$TEST_TMP"
 test_syntax
 test_successful_run
 test_log_budget_stop
+test_shipped_tree_no_secret_self_trigger
 test_secret_filename
 test_secret_content
+test_secret_pgp_content
 test_placeholders_not_blocked
 test_dirty_repo_rejected
 test_model_failure_distinguished

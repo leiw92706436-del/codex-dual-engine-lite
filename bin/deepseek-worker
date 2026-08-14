@@ -161,9 +161,19 @@ FILENAME_RULES=(
 # High-confidence secret content rules: rule-name followed by an extended
 # regular expression. These avoid short/placeholder values to minimize false
 # positives.
+#
+# PEM and PGP private-key block markers are assembled from fragments at
+# runtime. This keeps the shipped worker from containing the same literal
+# signatures that the preflight itself must block in delegated repositories.
+pem_marker_start="-----BEGIN"
+pem_marker_end="PRIVATE KEY-----"
+pem_marker_body="[A-Z0-9 ]*"
+pgp_marker_start="-----BEGIN PGP"
+pgp_marker_end="PRIVATE KEY BLOCK-----"
+
 CONTENT_RULES=(
-  "pem-private-key" "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
-  "pgp-private-key" "-----BEGIN PGP PRIVATE KEY BLOCK-----"
+  "pem-private-key" "${pem_marker_start} ${pem_marker_body}${pem_marker_end}"
+  "pgp-private-key" "${pgp_marker_start} ${pgp_marker_end}"
   "aws-access-key-id" "AKIA[0-9A-Z]{16}"
   "github-token" "(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}"
   "google-api-key" "AIza[0-9A-Za-z_-]{35}"
