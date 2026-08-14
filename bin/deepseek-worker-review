@@ -71,11 +71,22 @@ review_packet_parse() {
     }
     function set_req(path, t, v) {
       if (path=="schema") { req["schema_type"]=t; req["schema"]=v }
+      else if (path=="version") { req["version_type"]=t; req["version"]=v }
+      else if (path=="task_id") { req["task_type"]=t; req["task"]=v }
+      else if (path=="base_commit") { req["base_type"]=t; req["base"]=v }
       else if (path=="model_exit_status") { req["model_type"]=t; req["model"]=v }
       else if (path=="budget.exceeded") { req["budget_type"]=t; req["budget"]=v }
+      else if (path=="budget_exceeded") { req["exec_budget_type"]=t; req["exec_budget"]=v }
       else if (path=="main_worktree_clean_after") { req["main_type"]=t; req["main"]=v }
       else if (path=="patch_sha256") { req["sha_type"]=t; req["sha"]=v }
       else if (path=="changed_file_count") { req["count_type"]=t; req["count"]=v }
+      else if (path=="runner_exit_status") { req["runner_type"]=t; req["runner"]=v }
+      else if (path=="stop_reason") { req["stop_type"]=t; req["stop"]=v }
+      else if (path=="status") { req["status_type"]=t; req["status"]=v }
+      else if (path=="after_patch_sha256") { req["after_sha_type"]=t; req["after_sha"]=v }
+      else if (path=="after_changed_file_count") { req["after_count_type"]=t; req["after_count"]=v }
+      else if (path=="delta_patch_sha256") { req["delta_sha_type"]=t; req["delta_sha"]=v }
+      else if (path=="delta_changed_file_count") { req["delta_count_type"]=t; req["delta_count"]=v }
     }
     function parse_scalar(path,   t, v) {
       t=types[i]; v=tokens[i]
@@ -174,6 +185,12 @@ review_packet_parse() {
       if (invalid) exit 1
       printf "schema_type=%s\n", req["schema_type"]
       printf "schema=%s\n", req["schema"]
+      printf "version_type=%s\n", req["version_type"]
+      printf "version=%s\n", req["version"]
+      printf "task_type=%s\n", req["task_type"]
+      printf "task=%s\n", req["task"]
+      printf "base_type=%s\n", req["base_type"]
+      printf "base=%s\n", req["base"]
       printf "model_type=%s\n", req["model_type"]
       printf "model=%s\n", req["model"]
       printf "budget_type=%s\n", req["budget_type"]
@@ -184,11 +201,33 @@ review_packet_parse() {
       printf "sha=%s\n", req["sha"]
       printf "count_type=%s\n", req["count_type"]
       printf "count=%s\n", req["count"]
+      printf "exec_budget_type=%s\n", req["exec_budget_type"]
+      printf "exec_budget=%s\n", req["exec_budget"]
+      printf "runner_type=%s\n", req["runner_type"]
+      printf "runner=%s\n", req["runner"]
+      printf "stop_type=%s\n", req["stop_type"]
+      printf "stop=%s\n", req["stop"]
+      printf "status_type=%s\n", req["status_type"]
+      printf "status=%s\n", req["status"]
+      printf "after_sha_type=%s\n", req["after_sha_type"]
+      printf "after_sha=%s\n", req["after_sha"]
+      printf "after_count_type=%s\n", req["after_count_type"]
+      printf "after_count=%s\n", req["after_count"]
+      printf "delta_sha_type=%s\n", req["delta_sha_type"]
+      printf "delta_sha=%s\n", req["delta_sha"]
+      printf "delta_count_type=%s\n", req["delta_count_type"]
+      printf "delta_count=%s\n", req["delta_count"]
     }
   ' "$packet") || die "REVIEW_PACKET.json is malformed or ambiguous" 1
 
   rp_schema_type=""
   rp_schema=""
+  rp_version_type=""
+  rp_version=""
+  rp_task_type=""
+  rp_task=""
+  rp_base_type=""
+  rp_base=""
   rp_model_type=""
   rp_model=""
   rp_budget_type=""
@@ -199,10 +238,32 @@ review_packet_parse() {
   rp_sha=""
   rp_count_type=""
   rp_count=""
+  rp_exec_budget_type=""
+  rp_exec_budget=""
+  rp_runner_type=""
+  rp_runner=""
+  rp_stop_type=""
+  rp_stop=""
+  rp_status_type=""
+  rp_status=""
+  rp_after_sha_type=""
+  rp_after_sha=""
+  rp_after_count_type=""
+  rp_after_count=""
+  rp_delta_sha_type=""
+  rp_delta_sha=""
+  rp_delta_count_type=""
+  rp_delta_count=""
   while IFS= read -r line; do
     case "$line" in
       schema_type=*) rp_schema_type=${line#schema_type=} ;;
       schema=*) rp_schema=${line#schema=} ;;
+      version_type=*) rp_version_type=${line#version_type=} ;;
+      version=*) rp_version=${line#version=} ;;
+      task_type=*) rp_task_type=${line#task_type=} ;;
+      task=*) rp_task=${line#task=} ;;
+      base_type=*) rp_base_type=${line#base_type=} ;;
+      base=*) rp_base=${line#base=} ;;
       model_type=*) rp_model_type=${line#model_type=} ;;
       model=*) rp_model=${line#model=} ;;
       budget_type=*) rp_budget_type=${line#budget_type=} ;;
@@ -213,8 +274,90 @@ review_packet_parse() {
       sha=*) rp_sha=${line#sha=} ;;
       count_type=*) rp_count_type=${line#count_type=} ;;
       count=*) rp_count=${line#count=} ;;
+      exec_budget_type=*) rp_exec_budget_type=${line#exec_budget_type=} ;;
+      exec_budget=*) rp_exec_budget=${line#exec_budget=} ;;
+      runner_type=*) rp_runner_type=${line#runner_type=} ;;
+      runner=*) rp_runner=${line#runner=} ;;
+      stop_type=*) rp_stop_type=${line#stop_type=} ;;
+      stop=*) rp_stop=${line#stop=} ;;
+      status_type=*) rp_status_type=${line#status_type=} ;;
+      status=*) rp_status=${line#status=} ;;
+      after_sha_type=*) rp_after_sha_type=${line#after_sha_type=} ;;
+      after_sha=*) rp_after_sha=${line#after_sha=} ;;
+      after_count_type=*) rp_after_count_type=${line#after_count_type=} ;;
+      after_count=*) rp_after_count=${line#after_count=} ;;
+      delta_sha_type=*) rp_delta_sha_type=${line#delta_sha_type=} ;;
+      delta_sha=*) rp_delta_sha=${line#delta_sha=} ;;
+      delta_count_type=*) rp_delta_count_type=${line#delta_count_type=} ;;
+      delta_count=*) rp_delta_count=${line#delta_count=} ;;
     esac
   done <<< "$output"
+}
+
+build_worktree_snapshot() {
+  local base="$1" patch_out="$2" files_out="$3" tracked_out="$4" untracked_out="$5" unsorted_out="$6"
+  local rel diff_rc
+
+  git -c core.quotePath=false -C "$worktree" diff --name-only -z "$base" -- > "$tracked_out" \
+    || die "failed to enumerate retry worktree changes" 1
+  git -c core.quotePath=false -C "$worktree" ls-files --others --exclude-standard -z > "$untracked_out" \
+    || die "failed to enumerate retry worktree untracked files" 1
+  git -C "$worktree" diff --binary --no-ext-diff --find-renames "$base" -- > "$patch_out" \
+    || die "failed to snapshot retry worktree" 1
+  : > "$unsorted_out"
+
+  while IFS= read -r -d '' rel; do
+    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+      || die "retry worktree path cannot be represented safely" 1
+    printf '%s\n' "$rel" >> "$unsorted_out"
+  done < "$tracked_out"
+
+  while IFS= read -r -d '' rel; do
+    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+      || die "retry worktree path cannot be represented safely" 1
+    [[ -f "$worktree/$rel" || -L "$worktree/$rel" ]] \
+      || die "unsupported retry worktree file type: $rel" 1
+    printf '%s\n' "$rel" >> "$unsorted_out"
+    if git -c core.quotePath=false -C "$worktree" diff --no-index --binary --no-ext-diff -- /dev/null "$rel" \
+      >> "$patch_out" 2>/dev/null; then
+      :
+    else
+      diff_rc=$?
+      [[ "$diff_rc" == "1" ]] || die "failed to snapshot retry untracked file: $rel" 1
+    fi
+  done < "$untracked_out"
+
+  LC_ALL=C sort -u "$unsorted_out" > "$files_out" \
+    || die "failed to normalize retry worktree file list" 1
+}
+
+reconstruct_tree_from_patch() {
+  local base="$1" patch_path="$2" index_path="$3" description="$4" tree
+  GIT_INDEX_FILE="$index_path" git -C "$worktree" read-tree "$base" \
+    || die "failed to initialize $description index" 1
+  GIT_INDEX_FILE="$index_path" git -C "$worktree" apply --cached --allow-empty --binary "$patch_path" \
+    || die "failed to reconstruct $description state" 1
+  tree=$(GIT_INDEX_FILE="$index_path" git -C "$worktree" write-tree) \
+    || die "failed to write $description tree" 1
+  [[ "$tree" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || die "invalid $description tree id" 1
+  printf '%s\n' "$tree"
+}
+
+build_tree_delta() {
+  local before_tree="$1" after_tree="$2" patch_out="$3" files_out="$4" raw_out="$5" unsorted_out="$6"
+  local rel
+  git -C "$worktree" diff --binary --no-ext-diff --find-renames "$before_tree" "$after_tree" -- > "$patch_out" \
+    || die "failed to regenerate retry delta patch" 1
+  git -c core.quotePath=false -C "$worktree" diff --name-only -z "$before_tree" "$after_tree" -- > "$raw_out" \
+    || die "failed to regenerate retry delta file list" 1
+  : > "$unsorted_out"
+  while IFS= read -r -d '' rel; do
+    [[ -n "$rel" && "$rel" != /* && "$rel" != *$'\n'* && "$rel" != *$'\r'* ]] \
+      || die "retry delta path cannot be represented safely" 1
+    printf '%s\n' "$rel" >> "$unsorted_out"
+  done < "$raw_out"
+  LC_ALL=C sort -u "$unsorted_out" > "$files_out" \
+    || die "failed to normalize retry delta file list" 1
 }
 
 pass_gate_checks() {
@@ -255,6 +398,169 @@ pass_gate_checks() {
     die "cannot verify source repository cleanliness" 1
   fi
   [[ -z "$repo_status" ]] || die "source repository is not clean" 1
+}
+
+cleanup_retry_review_validation() {
+  if [[ -n "${retry_review_tmp:-}" ]]; then
+    rm -rf -- "$retry_review_tmp"
+    retry_review_tmp=""
+  fi
+}
+
+retry_pass_gate_checks() {
+  local retry_dir="$result_dir/retry" attempt_dir="$result_dir/retry/attempt-1"
+  local artifact prepared execution actual_sha actual_count
+  local prepared_sha prepared_count prepared_base
+  local execution_after_sha execution_after_count execution_delta_sha execution_delta_count
+  local branch expected_branch common_git_dir repo_root source_repo source_head worktree_head repo_status
+
+  [[ -d "$retry_dir" && ! -L "$retry_dir" ]] || die "retry directory is missing or unsafe" 1
+  [[ -d "$attempt_dir" && ! -L "$attempt_dir" ]] || die "retry attempt is missing or unsafe" 1
+  is_within "$attempt_dir" "$result_dir" || die "retry attempt escapes result directory" 1
+
+  for artifact in task.txt before.patch before-files.txt PREPARED.json retry.log \
+    EXECUTION.json after.patch after-files.txt delta.patch delta-files.txt; do
+    require_artifact "$attempt_dir" "$artifact"
+  done
+
+  prepared="$attempt_dir/PREPARED.json"
+  review_packet_parse "$prepared"
+  [[ "$rp_schema_type" == "string" && "$rp_schema" == "dual-engine-retry.v1" ]] \
+    || die "PREPARED.json schema is invalid" 1
+  [[ "$rp_version_type" == "string" && "$rp_version" == "$VERSION" ]] \
+    || die "PREPARED.json version is invalid" 1
+  [[ "$rp_task_type" == "string" && "$rp_task" == "$task_id" ]] \
+    || die "PREPARED.json task_id does not match" 1
+  [[ "$rp_base_type" == "string" && "$rp_base" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] \
+    || die "PREPARED.json base_commit is invalid" 1
+  [[ "$rp_status_type" == "string" && "$rp_status" == "PREPARED" ]] \
+    || die "PREPARED.json status is invalid" 1
+  [[ "$rp_sha_type" == "string" && "$rp_sha" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "PREPARED.json patch_sha256 is invalid" 1
+  [[ "$rp_count_type" == "number" && "$rp_count" =~ ^[0-9]+$ ]] \
+    || die "PREPARED.json changed_file_count is invalid" 1
+  prepared_base="$rp_base"
+  prepared_sha="$rp_sha"
+  prepared_count="$rp_count"
+
+  actual_sha=$(shasum -a 256 "$attempt_dir/before.patch" | awk '{print $1}')
+  [[ "$actual_sha" == "$prepared_sha" ]] \
+    || die "before.patch does not match PREPARED.json" 1
+  actual_count=$(grep -c -v '^[[:space:]]*$' "$attempt_dir/before-files.txt" 2>/dev/null || true)
+  [[ "$actual_count" == "$prepared_count" ]] \
+    || die "before-files.txt count does not match PREPARED.json" 1
+
+  execution="$attempt_dir/EXECUTION.json"
+  review_packet_parse "$execution"
+  [[ "$rp_schema_type" == "string" && "$rp_schema" == "dual-engine-retry-execution.v1" ]] \
+    || die "EXECUTION.json schema is invalid" 1
+  [[ "$rp_version_type" == "string" && "$rp_version" == "$VERSION" ]] \
+    || die "EXECUTION.json version is invalid" 1
+  [[ "$rp_task_type" == "string" && "$rp_task" == "$task_id" ]] \
+    || die "EXECUTION.json task_id does not match" 1
+  [[ "$rp_runner_type" == "number" && "$rp_runner" == "0" ]] \
+    || die "EXECUTION.json runner_exit_status is not exactly 0" 1
+  [[ "$rp_exec_budget_type" == "false" && "$rp_exec_budget" == "false" ]] \
+    || die "EXECUTION.json budget_exceeded is not false" 1
+  [[ "$rp_stop_type" == "string" && "$rp_stop" == "process_exit" ]] \
+    || die "EXECUTION.json stop_reason is not process_exit" 1
+  [[ "$rp_status_type" == "string" && "$rp_status" == "COMPLETE" ]] \
+    || die "EXECUTION.json status is not COMPLETE" 1
+  [[ "$rp_after_sha_type" == "string" && "$rp_after_sha" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "EXECUTION.json after_patch_sha256 is invalid" 1
+  [[ "$rp_after_count_type" == "number" && "$rp_after_count" =~ ^[0-9]+$ ]] \
+    || die "EXECUTION.json after_changed_file_count is invalid" 1
+  [[ "$rp_delta_sha_type" == "string" && "$rp_delta_sha" =~ ^[0-9a-fA-F]{64}$ ]] \
+    || die "EXECUTION.json delta_patch_sha256 is invalid" 1
+  [[ "$rp_delta_count_type" == "number" && "$rp_delta_count" =~ ^[0-9]+$ ]] \
+    || die "EXECUTION.json delta_changed_file_count is invalid" 1
+  execution_after_sha="$rp_after_sha"
+  execution_after_count="$rp_after_count"
+  execution_delta_sha="$rp_delta_sha"
+  execution_delta_count="$rp_delta_count"
+
+  actual_sha=$(shasum -a 256 "$attempt_dir/after.patch" | awk '{print $1}')
+  [[ "$actual_sha" == "$execution_after_sha" ]] \
+    || die "after.patch does not match EXECUTION.json" 1
+  actual_count=$(grep -c -v '^[[:space:]]*$' "$attempt_dir/after-files.txt" 2>/dev/null || true)
+  [[ "$actual_count" == "$execution_after_count" ]] \
+    || die "after-files.txt count does not match EXECUTION.json" 1
+  actual_sha=$(shasum -a 256 "$attempt_dir/delta.patch" | awk '{print $1}')
+  [[ "$actual_sha" == "$execution_delta_sha" ]] \
+    || die "delta.patch does not match EXECUTION.json" 1
+  actual_count=$(grep -c -v '^[[:space:]]*$' "$attempt_dir/delta-files.txt" 2>/dev/null || true)
+  [[ "$actual_count" == "$execution_delta_count" ]] \
+    || die "delta-files.txt count does not match EXECUTION.json" 1
+
+  worktree="$task_dir/worktree"
+  [[ -d "$worktree" && ! -L "$worktree" ]] || die "retry worktree is missing or unsafe" 1
+  is_within "$worktree" "$task_dir" || die "retry worktree escapes managed task directory" 1
+  worktree=$(cd -P "$worktree" 2>/dev/null && pwd -P) || die "could not resolve retry worktree" 1
+  git -C "$worktree" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "retry worktree is not a Git worktree" 1
+  git -C "$worktree" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $worktree" \
+    || die "retry worktree is not registered" 1
+
+  branch=$(marker_field branch)
+  expected_branch="codex-ds/$task_id"
+  [[ "$branch" == "$expected_branch" ]] || die "managed marker has an unexpected branch" 1
+  [[ "$(git -C "$worktree" symbolic-ref --short HEAD 2>/dev/null || true)" == "$branch" ]] \
+    || die "retry worktree branch does not match managed marker" 1
+
+  common_git_dir=$(git -C "$worktree" rev-parse --git-common-dir 2>/dev/null || true)
+  [[ -n "$common_git_dir" ]] || die "could not resolve common Git directory" 1
+  case "$common_git_dir" in
+    /*) ;;
+    *) common_git_dir="$worktree/$common_git_dir" ;;
+  esac
+  repo_root=$(cd "$common_git_dir/.." 2>/dev/null && pwd -P) \
+    || die "could not resolve source repository" 1
+  source_repo=$(marker_field repo)
+  [[ "$source_repo" == /* && -d "$source_repo" && ! -L "$source_repo" ]] \
+    || die "managed marker has invalid source repository" 1
+  source_repo=$(cd -P "$source_repo" 2>/dev/null && pwd -P) \
+    || die "could not resolve source repository" 1
+  [[ "$source_repo" == "$repo_root" ]] || die "source repository does not match retry worktree" 1
+  source_head=$(git -C "$source_repo" rev-parse HEAD 2>/dev/null || true)
+  worktree_head=$(git -C "$worktree" rev-parse HEAD 2>/dev/null || true)
+  [[ -n "$source_head" && "$worktree_head" == "$source_head" && "$worktree_head" == "$prepared_base" ]] \
+    || die "retry base, worktree HEAD, and source HEAD do not match" 1
+  if ! repo_status=$(git -C "$source_repo" status --porcelain 2>/dev/null); then
+    die "cannot verify source repository cleanliness" 1
+  fi
+  [[ -z "$repo_status" ]] || die "source repository is not clean" 1
+
+  umask 077
+  retry_review_tmp=$(mktemp -d "$attempt_dir/.review-validate.XXXXXX") \
+    || die "failed to create retry review validation directory" 1
+  chmod 700 "$retry_review_tmp"
+  trap cleanup_retry_review_validation EXIT
+
+  local current_patch="$retry_review_tmp/current.patch"
+  local current_files="$retry_review_tmp/current-files.txt"
+  local tracked="$retry_review_tmp/.tracked" untracked="$retry_review_tmp/.untracked"
+  local unsorted="$retry_review_tmp/.unsorted" before_index="$retry_review_tmp/.before.index"
+  local after_index="$retry_review_tmp/.after.index" before_tree after_tree
+  local delta_patch="$retry_review_tmp/delta.patch" delta_files="$retry_review_tmp/delta-files.txt"
+  local delta_raw="$retry_review_tmp/.delta-raw" delta_unsorted="$retry_review_tmp/.delta-unsorted"
+
+  build_worktree_snapshot "$worktree_head" "$current_patch" "$current_files" \
+    "$tracked" "$untracked" "$unsorted"
+  cmp -s "$current_patch" "$attempt_dir/after.patch" \
+    || die "current retry worktree does not match after.patch" 1
+  cmp -s "$current_files" "$attempt_dir/after-files.txt" \
+    || die "current retry worktree does not match after-files.txt" 1
+
+  before_tree=$(reconstruct_tree_from_patch "$worktree_head" "$attempt_dir/before.patch" "$before_index" "before")
+  after_tree=$(reconstruct_tree_from_patch "$worktree_head" "$attempt_dir/after.patch" "$after_index" "after")
+  build_tree_delta "$before_tree" "$after_tree" "$delta_patch" "$delta_files" "$delta_raw" "$delta_unsorted"
+  cmp -s "$delta_patch" "$attempt_dir/delta.patch" \
+    || die "delta.patch is inconsistent with before and after states" 1
+  cmp -s "$delta_files" "$attempt_dir/delta-files.txt" \
+    || die "delta-files.txt is inconsistent with before and after states" 1
+
+  cleanup_retry_review_validation
+  trap - EXIT
 }
 
 usage() {
@@ -318,12 +624,35 @@ if ! grep -qxF "task_id=$task_id" "$marker"; then
   die "managed marker does not match task id: $task_id" 1
 fi
 
+review_file="$result_dir/SOL_REVIEW.md"
+retry_attempt="$result_dir/retry/attempt-1"
+review_verdict_count=0
+current_review_is_retry="false"
+if [[ -e "$review_file" || -L "$review_file" ]]; then
+  [[ -f "$review_file" && ! -L "$review_file" ]] || die "SOL_REVIEW.md is unsafe" 1
+  review_verdict_count=$(grep -c -E -i '^[[:space:]]*verdict[[:space:]]*:' "$review_file" 2>/dev/null || true)
+  [[ "$review_verdict_count" =~ ^[0-9]+$ ]] || die "could not parse SOL_REVIEW.md" 1
+  if [[ "$review_verdict_count" == "1" ]] && grep -qxF 'verdict: RETRY' "$review_file"; then
+    current_review_is_retry="true"
+  fi
+fi
+
+if [[ "$verdict" == "RETRY" && ( -e "$retry_attempt" || -L "$retry_attempt" ) ]]; then
+  die "a retry attempt already exists; a second RETRY is not allowed" 1
+fi
+
 if [[ "$verdict" == "PASS" ]]; then
-  pass_gate_checks
+  if [[ "$current_review_is_retry" == "true" || -e "$retry_attempt" || -L "$retry_attempt" ]]; then
+    [[ "$review_verdict_count" == "1" && "$current_review_is_retry" == "true" ]] \
+      || die "final retry PASS requires exactly one canonical prior RETRY verdict" 1
+    retry_pass_gate_checks
+  else
+    pass_gate_checks
+  fi
 fi
 
 recorded_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
-target="$result_dir/SOL_REVIEW.md"
+target="$review_file"
 
 umask 077
 tmp=$(mktemp "$result_dir/.sol-review.XXXXXX") || die "failed to create review temp file" 1

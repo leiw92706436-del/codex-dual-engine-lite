@@ -754,6 +754,10 @@ test_retry_prepare() {
   assert_eq "retry preparation rejects a non-RETRY verdict" 1 "$?"
 
   run_review "$task_id" RETRY "one bounded correction" >/dev/null 2>&1
+  run_review "$task_id" PASS "must not bypass missing retry execution" >/dev/null 2>&1
+  assert_eq "final PASS rejects a requested retry with no prepared attempt" 1 "$?"
+  assert_contains "failed final PASS preserves the RETRY verdict" "$(cat "$review_file")" \
+    "verdict: RETRY"
   printf 'verdict: RETRY\n' >> "$review_file"
   run_retry prepare "$task_id" --task-file "$correction" >/dev/null 2>&1
   assert_eq "retry preparation rejects duplicate verdicts" 1 "$?"
@@ -938,6 +942,64 @@ test_retry_execute() {
   assert_eq "execute rejects --task-file" 2 "$RETRY_RC"
   assert_eq "invalid execute options do not invoke the runner" "$stub_count_after" \
     "$(grep -cF STUB_INVOKED "$STUB_LOG" 2>/dev/null || true)"
+
+  cp "$attempt_dir/EXECUTION.json" "$TEST_TMP/retry-execution-original.json"
+  cp "$attempt_dir/after.patch" "$TEST_TMP/retry-after-original.patch"
+  cp "$attempt_dir/delta.patch" "$TEST_TMP/retry-delta-original.patch"
+  cp "$worktree/src/hello.txt" "$TEST_TMP/retry-worktree-original.txt"
+  cp "$repo/src/hello.txt" "$TEST_TMP/retry-source-original.txt"
+
+  printf 'tamper\n' >> "$attempt_dir/after.patch"
+  run_review "$task_id" PASS "reject tampered after patch" >/dev/null 2>&1
+  assert_eq "final retry PASS rejects a tampered after patch" 1 "$?"
+  cp "$TEST_TMP/retry-after-original.patch" "$attempt_dir/after.patch"
+
+  printf 'semantic delta tamper\n' >> "$attempt_dir/delta.patch"
+  local forged_delta_sha
+  forged_delta_sha=$(shasum -a 256 "$attempt_dir/delta.patch" | awk '{print $1}')
+  sed "s/\(\"delta_patch_sha256\": \"\)[0-9a-fA-F]*\(\"\)/\1$forged_delta_sha\2/" \
+    "$attempt_dir/EXECUTION.json" > "$TEST_TMP/retry-execution-forged.json"
+  mv "$TEST_TMP/retry-execution-forged.json" "$attempt_dir/EXECUTION.json"
+  run_review "$task_id" PASS "reject forged delta" >/dev/null 2>&1
+  assert_eq "final retry PASS independently rejects a forged delta" 1 "$?"
+  cp "$TEST_TMP/retry-delta-original.patch" "$attempt_dir/delta.patch"
+  cp "$TEST_TMP/retry-execution-original.json" "$attempt_dir/EXECUTION.json"
+
+  sed 's/"status": "COMPLETE"/"status": "FAILED"/' "$attempt_dir/EXECUTION.json" \
+    > "$TEST_TMP/retry-execution-failed.json"
+  mv "$TEST_TMP/retry-execution-failed.json" "$attempt_dir/EXECUTION.json"
+  run_review "$task_id" PASS "reject failed execution" >/dev/null 2>&1
+  assert_eq "final retry PASS rejects FAILED execution status" 1 "$?"
+  cp "$TEST_TMP/retry-execution-original.json" "$attempt_dir/EXECUTION.json"
+
+  awk '/^  "schema":/ { print; print "  \"schema\": \"dual-engine-retry-execution.v1\","; next } { print }' \
+    "$attempt_dir/EXECUTION.json" > "$TEST_TMP/retry-execution-duplicate.json"
+  mv "$TEST_TMP/retry-execution-duplicate.json" "$attempt_dir/EXECUTION.json"
+  run_review "$task_id" PASS "reject ambiguous execution JSON" >/dev/null 2>&1
+  assert_eq "final retry PASS rejects duplicate execution fields" 1 "$?"
+  cp "$TEST_TMP/retry-execution-original.json" "$attempt_dir/EXECUTION.json"
+
+  printf 'post-execution drift\n' >> "$worktree/src/hello.txt"
+  run_review "$task_id" PASS "reject post-execution drift" >/dev/null 2>&1
+  assert_eq "final retry PASS rejects worktree drift after execution" 1 "$?"
+  cp "$TEST_TMP/retry-worktree-original.txt" "$worktree/src/hello.txt"
+
+  printf 'dirty source after retry\n' >> "$repo/src/hello.txt"
+  run_review "$task_id" PASS "reject dirty source" >/dev/null 2>&1
+  assert_eq "final retry PASS rejects a dirty source repository" 1 "$?"
+  cp "$TEST_TMP/retry-source-original.txt" "$repo/src/hello.txt"
+
+  head_before=$(git -C "$repo" rev-parse HEAD)
+  run_review "$task_id" PASS "retry delta independently validated" >/dev/null 2>&1
+  assert_eq "final retry PASS succeeds for a consistent execution package" 0 "$?"
+  assert_contains "final retry review records PASS" "$(cat "$task_dir/result/SOL_REVIEW.md")" \
+    "verdict: PASS"
+  assert_eq "final retry PASS leaves source HEAD unchanged" "$head_before" "$(git -C "$repo" rev-parse HEAD)"
+  assert_eq "final retry PASS leaves source repository clean" "" "$(git -C "$repo" status --porcelain)"
+  run_review "$task_id" RETRY "must not create a second attempt" >/dev/null 2>&1
+  assert_eq "review gate refuses a second RETRY after attempt 1 exists" 1 "$?"
+  assert_contains "second RETRY refusal preserves final PASS" "$(cat "$task_dir/result/SOL_REVIEW.md")" \
+    "verdict: PASS"
 
   task_id=$(new_retry_task retry-execute-tampered-patch "$correction")
   attempt_dir="$TEST_DATA/tasks/$task_id/result/retry/attempt-1"
