@@ -1,8 +1,14 @@
 # Threat model
 
 This document describes the threat model for Codex Dual Engine Lite v0.2. The
-trust boundary is between the local operator, the delegated model, repository
-content, the macOS Keychain, and the independent human/Sol reviewer.
+trust boundary is between the local operator, the external delegated model,
+repository content, the macOS Keychain, the Codex CLI provider configuration,
+and the independent Codex/Sol reviewer.
+
+DeepSeek V4 Pro is an external provider model invoked through `codex-ds` and
+the Codex CLI. It is not bundled or self-hosted by this repository, and this
+repository does not automatically route tasks, merge results, or select
+DeepSeek Harness as a default.
 
 ## Assets
 
@@ -14,10 +20,11 @@ content, the macOS Keychain, and the independent human/Sol reviewer.
 ## Actors
 
 - **Operator**: runs the CLI and reviews results. Assumed trusted.
-- **Delegated model**: untrusted; it can produce arbitrary file changes and
-  prompt text.
+- **Delegated model**: the external DeepSeek V4 Pro provider model; untrusted,
+  and it can produce arbitrary file changes and prompt text.
 - **Repository content**: untrusted; it may be a prompt-injection vector.
-- **Human/Sol reviewer**: independent and trusted, but may make mistakes.
+- **Codex/Sol reviewer**: the independent local Codex agent or human; trusted,
+  but may make mistakes.
 
 ## Threats
 
@@ -32,7 +39,8 @@ Mitigations:
 - The model runs inside a workspace-write (or read-only) sandbox.
 - There is no default approval bypass or `danger-full-access`.
 - Automatic approvals are opt-in and still sandboxed.
-- Nothing is merged or pushed; a human/Sol reviewer inspects the diff.
+- There is no automatic task routing or merge-on-approval behavior.
+- Nothing is merged or pushed; a Codex/Sol reviewer inspects the diff.
 
 Residual risk: a sufficiently capable model may still attempt to write files
 inside the worktree, print secrets it can read from the worktree, or request
@@ -134,7 +142,7 @@ Mitigations:
 Residual risk: an operator may manually apply an untrusted diff; that is an
 out-of-band action.
 
-### 8. Independent human/Sol review boundary
+### 8. Independent Codex/Sol review boundary
 
 The product is only safe if an independent party reviews results.
 
@@ -147,8 +155,30 @@ Mitigations:
   requires a successful private execution package and independently
   reconstructs both the current after-state and the retry-only delta; a second
   RETRY is refused.
-- The tool does not claim to perform automatic Sol reasoning or merging.
+- The tool does not claim to perform automatic Codex/Sol reasoning or merging.
 
 Residual risk: the locally computed structural and safety checks do not
-establish semantic code correctness, and independent human/Sol review remains
+establish semantic code correctness, and independent Codex/Sol review remains
 required; the tool cannot verify that a human actually read the diff.
+
+### 9. External provider and Harness boundary
+
+DeepSeek V4 Pro is an external provider model. The repository delegates to it
+through `codex-ds`, which builds an isolated Codex CLI provider configuration
+at run time. Repository content and the task prompt may be sent to that
+provider, so operators must treat them as externally shared data.
+
+Mitigations:
+
+- The repository contains no model weights, provider credentials, or real API
+  keys.
+- `codex-ds` reads the API key from the macOS Keychain and injects it only
+  into the child model process.
+- The main worktree is not shared with the provider; only the isolated linked
+  worktree is used as the Codex CLI working root.
+- DeepSeek Harness is not the default and is not installed or routed by this
+  repository.
+
+Residual risk: operators must still review the provider's terms, data-retention
+policies, and model-visible context before delegating sensitive or proprietary
+repositories.

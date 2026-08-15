@@ -1,17 +1,33 @@
 # Codex Dual Engine Lite
 
-A small, safety-first orchestration kit for delegating a bounded task to a
-DeepSeek model through the Codex CLI, while keeping the caller's main worktree
-untouched and requiring independent human/Sol review before anything is used.
+A small, safety-first orchestration kit for delegating a bounded task to
+DeepSeek V4 Pro through the Codex CLI, while keeping the caller's main
+worktree untouched and requiring independent Codex/Sol review before anything
+is used.
+
+DeepSeek V4 Pro is an external provider model. This repository does not bundle,
+self-host, or proxy the model itself. `bin/codex-ds` is the adapter that
+prepares an isolated Codex CLI configuration and invokes the external provider;
+it does not implement or replace the model.
+
+Codex/Sol is the independent reviewer: the local Codex agent or human that
+inspects the result package and records `PASS`, `RETRY`, or `TAKEOVER`. The
+delegated model is never the reviewer and never decides that its own work is
+safe to apply.
+
+This project does not provide automatic merge or routing. DeepSeek Harness is
+not the default engine and is not part of this repository; see
+[docs/COST_CONTROL_AND_AB.md](docs/COST_CONTROL_AND_AB.md) for the optional
+experiment-only comparison boundary.
 
 ```text
-Codex / Sol
+Codex / Sol (independent reviewer)
     |
     v
 bounded DeepSeek V4 Pro worker  -->  isolated Git worktree
     |                                     |
     |        (never commits, merges,      |
-    |         pushes, or patches)         |
+    |         pushes, patches, or routes) |
     v                                     v
 result package + diff               independent Sol review
 ```
@@ -27,7 +43,8 @@ It does:
 - copy a clean Git repository into an isolated, linked worktree under the
   product data directory;
 - run a fail-closed secret preflight before the model sees any files;
-- invoke the model through the Codex CLI with a `workspace-write` sandbox;
+- invoke external DeepSeek V4 Pro through `codex-ds` and the Codex CLI with a
+  `workspace-write` sandbox;
 - preserve an auditable result package (diff, changed-file list, metadata, log);
 - record an independent human/Sol review verdict as a separate action, with a
   fail-closed PASS gate that verifies the local result invariants before
@@ -62,7 +79,7 @@ It does **not**:
 
 ```text
 bin/                         shipped CLI scripts
-  codex-ds                   model entrypoint (isolated CODEX_HOME + Keychain)
+  codex-ds                   external-provider adapter (isolated CODEX_HOME + Keychain)
   deepseek-worker            bounded task -> isolated worktree -> result package
   deepseek-worker-review     records PASS|RETRY|TAKEOVER
   deepseek-worker-retry      prepares and executes one reviewed delta-only retry
@@ -93,7 +110,10 @@ to `$CODEX_DUAL_ENGINE_LITE_HOME/config.toml` and can be overridden with
 `CODEX_DUAL_ENGINE_LITE_CONFIG`.
 
 No credentials are stored in the config file. The API key is kept only in the
-macOS Keychain and read at execution time.
+macOS Keychain and read at execution time. `codex-ds` writes a temporary,
+mode-0600 Codex CLI configuration that points at the external DeepSeek V4 Pro
+provider; the provider model, base URL, and credential are never embedded in
+this repository.
 
 ## Prerequisites
 
@@ -166,6 +186,12 @@ mkdir -p "$HOME/.local/share/codex-dual-engine-lite"
 cp config/config.example.toml "$HOME/.local/share/codex-dual-engine-lite/config.toml"
 ```
 
+The `base_url` and `model` values are placeholders. Set them to the external
+DeepSeek V4 Pro endpoint and the model ID authorized for your account. The
+model is not self-hosted by this project. Only full-line comments are supported
+by the bundled configuration parser, so keep inline comments out of
+`config.toml`.
+
 ```toml
 [provider]
 name = "deepseek"
@@ -178,11 +204,21 @@ service = "codex-dual-engine-lite"
 account = "deepseek-api-key"
 
 [execution]
-sandbox = "workspace-write"   # read-only or workspace-write; danger-full-access is rejected
-auto_approve = false          # explicit opt-in; maps to --approve-for-me
+# Allowed values: read-only or workspace-write.
+# danger-full-access is rejected.
+sandbox = "workspace-write"
+# Explicit opt-in. Maps to --approve-for-me, not to an approval/sandbox bypass.
+auto_approve = false
 
 [preflight]
-allowlist = ""                # optional comma-separated repo-relative globs
+# Optional comma-separated repo-relative globs.
+allowlist = ""
+
+[budgets]
+max_runtime_seconds = 1800
+max_log_bytes = 2000000
+max_changed_files = 100
+max_patch_bytes = 5000000
 ```
 
 All of these values can also be supplied via environment variables
@@ -387,17 +423,22 @@ safe install/uninstall.
   Keychain; the tool defends against path injection and operator error, not
   against an already-compromised account.
 
-## Cost control and Harness experiment
+## Cost control
 
 See [docs/COST_CONTROL_AND_AB.md](docs/COST_CONTROL_AND_AB.md) for the quiet
-delegation protocol, fixed review packet, risk-based Sol review, budgets, and
-the controlled Codex CLI versus DeepSeek Harness experiment.
+delegation protocol, fixed review packet, risk-based Codex/Sol review, and
+budgets. Runtime and log-size limits are circuit breakers, not exact provider
+token meters.
+
+DeepSeek Harness is not the default engine. It can be compared manually in a
+controlled, budgeted experiment only; this repository provides no automatic
+routing or migration to Harness.
 
 ## Not implemented
 
 By design this repository does **not** include automatic task routing,
 automatic or multi-attempt retry orchestration, automatic merging, a
 production DeepSeek Harness integration, Claude Code integration, Luna
-integration, a GUI, GitHub Actions, telemetry, package
-publishing, or remote publishing. A bounded local Harness A/B is documented as
-an experiment, not a migration.
+integration, a GUI, GitHub Actions, telemetry, package publishing, or remote
+publishing. DeepSeek Harness, Claude Code, and Luna are external options that
+may be compared manually; none is a default or a migration target.

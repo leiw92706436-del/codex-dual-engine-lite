@@ -2,8 +2,14 @@
 
 Codex Dual Engine Lite is a local, safety-first orchestration kit. It gives a
 bounded worker access to a copy of a Git repository and asks an independent
-human (or Sol) reviewer to approve the result. Security depends on both the
-mechanical controls below and on that human review boundary.
+Codex/Sol reviewer (a local Codex agent or human) to approve the result.
+Security depends on both the mechanical controls below and on that independent
+review boundary.
+
+DeepSeek V4 Pro is an external provider model. It is invoked through the
+`codex-ds` adapter and the Codex CLI; it is not bundled, self-hosted, or
+reviewed by this repository. The delegated model is untrusted and is never the
+reviewer.
 
 ## What this project does and does not do
 
@@ -11,13 +17,15 @@ It does:
 
 - copy a clean Git repository into an isolated, linked worktree;
 - scan tracked files for obvious secrets before a model sees them;
-- run a configured model through the Codex CLI with a workspace-write sandbox;
+- run external DeepSeek V4 Pro through `codex-ds` and the Codex CLI with a
+  workspace-write sandbox;
 - preserve a result package (diff, changed-file list, log, metadata);
-- record a human/Sol review verdict without applying anything.
+- record a Codex/Sol review verdict without applying anything.
 
 It does not merge, commit, push, cherry-pick, apply patches, or modify the
 caller's main worktree. The worker only creates a uniquely named branch and a
-linked worktree under the product data directory.
+linked worktree under the product data directory. It does not route tasks,
+merge approvals, or provide an automatic migration to DeepSeek Harness.
 
 ## Reporting a vulnerability
 
@@ -32,6 +40,9 @@ a public issue with a working exploit or a real secret. Include:
 
 - The API key is read from the macOS Keychain at execution time and is never
   written to disk, printed, or placed in a process argument list.
+- The repository contains no bundled DeepSeek V4 Pro model, provider
+  credentials, or generated API configuration; `codex-ds` builds an isolated,
+  mode-0600 Codex CLI provider config at run time.
 - `DEEPSEEK_API_KEY` (or the configured `env_key`) is removed from the child
   environment and replaced only with the Keychain value for the model process.
 - The main worktree is never the working root of the model; only the linked
@@ -40,6 +51,9 @@ a public issue with a working exploit or a real secret. Include:
 - The model runs under `--sandbox workspace-write` (or `read-only`), never
   `danger-full-access`, and never
   `--dangerously-bypass-approvals-and-sandbox`.
+- DeepSeek Harness is not the default engine and is outside this repository's
+  operational trust boundary; any manual comparison must be separately
+  budgeted and reviewed.
 
 ## Threats and mitigations
 
@@ -53,7 +67,8 @@ The main classes are:
 - log leakage;
 - over-broad sandbox or approval settings;
 - complete but untrusted patches or diffs;
-- the absence of independent human/Sol review.
+- the absence of independent Codex/Sol review;
+- accidental routing, merging, or default Harness migration.
 
 ## Operational guidance
 

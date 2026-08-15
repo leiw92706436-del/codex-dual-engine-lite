@@ -13,6 +13,11 @@
 config.toml
 install-manifest.tsv
 
+# Local secrets and environment files (never commit)
+.env
+.env.*
+!.env.example
+
 # Test artifacts
 tests/tmp/
 tests/*.tmp/

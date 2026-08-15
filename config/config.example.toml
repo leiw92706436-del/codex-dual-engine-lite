@@ -4,19 +4,23 @@
 # Default location: ~/.local/share/codex-dual-engine-lite/config.toml
 #
 # This file must never contain real credentials. The API key is stored only in
-# the macOS Keychain (see SECURITY.md and README.md).
+# the macOS Keychain (see SECURITY.md and README.md). DeepSeek V4 Pro is an
+# external provider model; this project does not bundle or self-host it.
 #
 # Only full-line comments are supported by the bundled parser; avoid inline
 # comments after a value.
 
 [provider]
-# Provider identifier used in the generated Codex CLI config.
+# Provider identifier used by codex-ds in the generated Codex CLI config.
 name = "deepseek"
-# OpenAI-compatible endpoint for your provider (or gateway). Replace this.
+# External DeepSeek-compatible endpoint for your provider or gateway.
+# Replace this with the URL authorized for your account.
 base_url = "REPLACE_WITH_BASE_URL"
-# Model name. Replace with the model your account is authorized to use.
+# External model ID for your account, for example the DeepSeek V4 Pro model ID
+# exposed by your provider. Replace this; do not commit a real key here.
 model = "REPLACE_WITH_MODEL"
-# Environment variable name that Codex CLI will read for the API key.
+# Environment variable name that codex-ds will export only to the child
+# Codex CLI process. The value comes from the macOS Keychain.
 env_key = "DEEPSEEK_API_KEY"
 
 [keychain]
