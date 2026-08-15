@@ -24,23 +24,38 @@ Before delegation:
    decisions.
 3. State the objective, allowed scope, exclusions, acceptance criteria, and
    validation commands.
-4. Keep the task self-contained. Do not ask the worker to explore unrelated
-   architecture or redesign the project.
+4. Keep the task self-contained and coherent. Include implementation and its
+   directly affected tests in one delegation when they form one deliverable;
+   do not split them into artificial one-file fragments merely to reduce V4
+   usage. Do not ask the worker to explore unrelated architecture or redesign
+   the project.
 5. Never print, inspect, or copy secret values.
 
 ## Run quietly
 
-From the source repository root:
+For implementation work, prioritize saving Codex/Sol quota. Give V4 Pro up to
+600 seconds and enough file/patch room for a coherent implementation plus its
+direct tests:
 
 ```sh
+CODEX_DUAL_ENGINE_LITE_MAX_RUNTIME_SECONDS=600 \
+CODEX_DUAL_ENGINE_LITE_MAX_LOG_BYTES=600000 \
+CODEX_DUAL_ENGINE_LITE_MAX_CHANGED_FILES=20 \
+CODEX_DUAL_ENGINE_LITE_MAX_PATCH_BYTES=2000000 \
 deepseek-worker "<bounded task>"
 ```
+
+The wrapper has no reliable model-token kill switch. The 600-second runtime is
+the enforceable doubled budget; log bytes are only a secondary circuit
+breaker, not a token count. Use a shorter 300-second profile only for an
+explicit smoke test or A/B experiment, not for normal V4 implementation.
 
 Let the command finish and retain only its short status output and task ID.
 Do not stream, summarize, or repeatedly inspect model reasoning, commands,
 tests, diffs, or `worker.log` while it runs. If the command becomes a
 background terminal session, poll only for completion; do not read its live
-transcript.
+transcript. Do not begin Sol implementation while V4 is still within the
+600-second budget.
 
 A worker exit code of zero means the result package was created. It is not a
 review verdict.
@@ -111,10 +126,12 @@ deepseek-worker-review TASK_ID PASS|RETRY|TAKEOVER "short evidence-based note"
 For `RETRY`, allow at most one delta-only correction. State the failing
 acceptance criterion and implicated files; do not resend the full transcript
 or ask for a broad reimplementation. Put that correction in a private local
-file, then run exactly:
+file, prepare it, then execute with the same doubled time/log profile:
 
 ```sh
 deepseek-worker-retry prepare TASK_ID --task-file CORRECTION_FILE
+CODEX_DUAL_ENGINE_LITE_RETRY_MAX_RUNTIME_SECONDS=600 \
+CODEX_DUAL_ENGINE_LITE_RETRY_MAX_LOG_BYTES=600000 \
 deepseek-worker-retry execute TASK_ID
 ```
 

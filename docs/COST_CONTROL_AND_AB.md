@@ -57,6 +57,13 @@ These are operational circuit breakers, not exact API-token meters. The Codex
 CLI does not currently expose a reliable per-task token kill switch to this
 wrapper, so log growth and elapsed time are used as bounded proxies.
 
+For normal V4 Pro implementation delegated by Sol, use the Plus-priority
+profile: 600 seconds, 600,000 private-log bytes, up to 20 changed files, and a
+2,000,000-byte patch. This doubles the 300-second development cap that caused
+premature partial results while still bounding one run. Keep implementation
+and directly affected tests together when they are one coherent deliverable.
+The 300-second profile is reserved for explicit smoke/A/B tests.
+
 ## Risk-based Sol review
 
 | level | typical changes | minimum review |
@@ -169,7 +176,9 @@ recorded TAKEOVER, completed the missing parts, and ran the independent suite.
 
 This shows that the fixed packet and takeover path save review attention, but
 also that Codex CLI/V4 still has a long task loop even with tight file scope.
-Do not automatically increase time or retry the same prompt. Prefer smaller
-implementation-only tasks, retain the five-minute circuit breaker, and let Sol
-take over when the partial result is structurally useful. The completed local
-suite now has 276 passing checks, including retry install/uninstall coverage.
+Do not automatically retry the same prompt. The corrected policy is to allow
+one coherent implementation plus its direct tests to run for ten minutes,
+without Sol watching or starting a parallel implementation. Let Sol take over
+only after that doubled budget expires or the result fails review. The
+completed local suite has 276 passing checks, including retry
+install/uninstall coverage.
