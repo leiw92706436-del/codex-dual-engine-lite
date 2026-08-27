@@ -1,27 +1,37 @@
 # Codex Dual Engine Lite
 
-A small, safety-first orchestration kit for delegating a bounded task to
-DeepSeek V4 Pro through the Codex CLI, while keeping the caller's main
-worktree untouched and requiring independent Codex/Sol review before anything
-is used.
+A Codex Skill and macOS CLI for delegating one bounded coding task to an
+external DeepSeek V4 Pro worker in an isolated Git worktree. The supervising
+Codex or human reviews the real diff and tests before deciding what happens
+next.
 
-DeepSeek V4 Pro is an external provider model. This repository does not bundle,
-self-host, or proxy the model itself. `bin/codex-ds` is the adapter that
-prepares an isolated Codex CLI configuration and invokes the external provider;
-it does not implement or replace the model.
+> Delegate the implementation pass, not the approval decision.
 
-Codex/Sol is the independent reviewer: the local Codex agent or human that
-inspects the result package and records `PASS`, `RETRY`, or `TAKEOVER`. The
-delegated model is never the reviewer and never decides that its own work is
-safe to apply.
+## In 30 seconds
 
-This project does not provide automatic merge or routing. DeepSeek Harness is
-not the default engine and is not part of this repository; see
-[docs/COST_CONTROL_AND_AB.md](docs/COST_CONTROL_AND_AB.md) for the optional
-experiment-only comparison boundary.
+Use this project when you want an external model to implement one clearly
+scoped change without giving it control of your main worktree or permission to
+merge, commit, push, or approve its own result.
+
+The worker produces an auditable result package containing the task, changed
+files, complete patch, local metadata, budgets, and logs. A separate reviewer
+then records exactly one of three outcomes: `PASS`, `RETRY`, or `TAKEOVER`.
+`PASS` means the result is eligible for manual use; this project still never
+applies it automatically.
+
+The original workflow calls the supervising reviewer **Codex/Sol**. Sol is a
+role name, not another bundled model or required product. DeepSeek V4 Pro is an
+external provider model; this repository does not bundle, self-host, or proxy
+it. `bin/codex-ds` only prepares an isolated Codex CLI configuration and invokes
+the configured external endpoint.
+
+This project is intentionally narrow. It does not automatically route tasks,
+guarantee lower total cost, or provide automatic merge. DeepSeek Harness is an
+experiment-only comparison target and is not part of the default path; see
+[the cost-control and A/B protocol](docs/COST_CONTROL_AND_AB.md).
 
 ```text
-Codex / Sol (independent reviewer)
+Supervising Codex or human (independent reviewer)
     |
     v
 bounded DeepSeek V4 Pro worker  -->  isolated Git worktree
@@ -29,12 +39,26 @@ bounded DeepSeek V4 Pro worker  -->  isolated Git worktree
     |        (never commits, merges,      |
     |         pushes, patches, or routes) |
     v                                     v
-result package + diff               independent Sol review
+result package + diff               independent review
 ```
 
 This is a **v0.2 local implementation**. It is not a routing layer or review
 automaton. It supports exactly one reviewed, delta-only retry, does not merge
 anything, and does not claim to be production-hardened.
+
+## How it relates to Auditable Agent Lab
+
+The two repositories are independent and solve different layers of the same
+problem:
+
+- [Auditable Agent Lab](https://github.com/leiw92706436-del/auditable-agent-lab)
+  provides reusable, dependency-free governance and evidence primitives.
+- **Codex Dual Engine Lite** is a concrete local orchestration tool for one
+  bounded coding delegation workflow.
+
+Neither repository depends on the other. Auditable Agent Lab defines generic
+control concepts; this repository demonstrates a specific supervised execution
+pattern with Git worktree isolation and an external model.
 
 ## What it does and does not do
 

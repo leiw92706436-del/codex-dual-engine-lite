@@ -1,6 +1,6 @@
 ---
 name: deepseek-delegation
-description: Delegate one bounded coding task to the existing DeepSeek V4 Pro worker in an isolated Git worktree, perform a cost-bounded independent Codex/Sol review, and optionally execute exactly one reviewed delta-only retry without merging. Use only when the user explicitly asks for DeepSeek, V4 Pro, Dual Engine B-lite, or this skill. Do not use for automatic routing, secrets, production writes, destructive actions, or unclear requirements.
+description: Delegate one bounded coding task to the existing DeepSeek V4 Pro worker in an isolated Git worktree, perform a cost-bounded independent review by the supervising Codex or human, and optionally execute exactly one reviewed delta-only retry without merging. Use only when the user explicitly asks for DeepSeek, V4 Pro, Dual Engine B-lite, or this skill. Do not use for automatic routing, secrets, production writes, destructive actions, or unclear requirements.
 ---
 
 # DeepSeek Delegation
@@ -10,8 +10,9 @@ worker creates an isolated worktree and a locally computed review packet. It
 never commits, merges, cherry-picks, pushes, or changes the caller's main
 worktree.
 
-The main objective is to save Codex/Sol quota without accepting model
-self-reports as proof.
+The main objective is to move one bounded implementation pass to an external
+worker without accepting the worker's self-report as proof. This may reduce
+supervisor usage, but it does not guarantee lower total cost.
 
 ## Prepare one bounded task
 
@@ -33,9 +34,9 @@ Before delegation:
 
 ## Run quietly
 
-For implementation work, prioritize saving Codex/Sol quota. Give V4 Pro up to
-600 seconds and enough file/patch room for a coherent implementation plus its
-direct tests:
+For implementation work, keep supervisor context usage bounded. Give V4 Pro up
+to 600 seconds and enough file/patch room for a coherent implementation plus
+its direct tests:
 
 ```sh
 CODEX_DUAL_ENGINE_LITE_MAX_RUNTIME_SECONDS=600 \
@@ -54,8 +55,8 @@ Let the command finish and retain only its short status output and task ID.
 Do not stream, summarize, or repeatedly inspect model reasoning, commands,
 tests, diffs, or `worker.log` while it runs. If the command becomes a
 background terminal session, poll only for completion; do not read its live
-transcript. Do not begin Sol implementation while V4 is still within the
-600-second budget.
+transcript. Do not begin a competing supervisor implementation while V4 is
+still within the 600-second budget.
 
 A worker exit code of zero means the result package was created. It is not a
 review verdict.
@@ -107,8 +108,8 @@ Escalate the depth whenever local evidence is riskier than the packet's
 classification. Never downgrade it based on the worker's prose.
 
 Prefer concise validation output: exit code, failing test names, and aggregate
-counts. Do not feed successful full test logs or the full patch back into Sol
-when direct local inspection is available.
+counts. Do not feed successful full test logs or the full patch back into the
+reviewer context when direct local inspection is available.
 
 ## Record exactly one verdict
 
@@ -121,7 +122,8 @@ deepseek-worker-review TASK_ID PASS|RETRY|TAKEOVER "short evidence-based note"
 - `PASS`: the implementation, scope, packet integrity, and independent
   validation satisfy the task.
 - `RETRY`: one narrow V4 Pro correction is worthwhile.
-- `TAKEOVER`: Sol should finish the work or a user decision is required.
+- `TAKEOVER`: the supervising Codex or human should finish the work, or a user
+  decision is required.
 
 For `RETRY`, allow at most one delta-only correction. State the failing
 acceptance criterion and implicated files; do not resend the full transcript
