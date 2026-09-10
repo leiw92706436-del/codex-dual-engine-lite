@@ -66,7 +66,7 @@ def _table_widths(rows):
     for r in rows:
         for i, c in enumerate(r):
             maxlen[i] = max(maxlen[i], min(len(c), 60))
-    weights = [max(4, m) for m in maxlen]
+    weights = [max(11, m) for m in maxlen]
     total = sum(weights)
     return [BODY_W * w / total for w in weights]
 
@@ -75,8 +75,8 @@ def _table_height(rows, font_pt):
     widths = _table_widths(rows)
     h = 0.0
     for r in rows:
-        lines = max(_lines(c, font_pt, w - 0.15) for c, w in zip(r, widths))
-        h += lines * font_pt * 1.3 / 72 + 0.14
+        lines = max(_lines(c, font_pt * 1.1, w - 0.2) for c, w in zip(r, widths))
+        h += lines * font_pt * 1.32 / 72 + 0.14
     return h + 0.1
 
 
@@ -89,12 +89,17 @@ def _note_height(text, font_pt):
 
 
 BASE = {"bullets": 16, "table": 12.5, "box": 13, "note": 11}
+CAP = {"bullets": 20, "table": 15, "box": 15.5, "note": 12.5}
+
+
+def _pt(kind, scale):
+    return min(BASE[kind] * scale, CAP[kind])
 
 
 def _total_height(body, scale):
     h = 0.0
     for kind, payload in body:
-        pt = BASE[kind] * scale
+        pt = _pt(kind, scale)
         if kind == "bullets":
             h += _bullets_height(payload, pt)
         elif kind == "table":
@@ -108,9 +113,9 @@ def _total_height(body, scale):
 
 def _fit_scale(body):
     avail = BODY_BOTTOM - BODY_TOP
-    scale = 1.0
+    scale = 1.3
     while scale > 0.62 and _total_height(body, scale) > avail:
-        scale -= 0.04
+        scale -= 0.03
     return scale
 
 
@@ -202,7 +207,7 @@ def draw_slide(prs, spec, chapter_label, page_no):
     scale = _fit_scale(body)
     y = BODY_TOP
     for kind, payload in body:
-        pt = BASE[kind] * scale
+        pt = _pt(kind, scale)
         if kind == "bullets":
             h = _bullets_height(payload, pt)
             tfb = _textbox(slide, MARGIN, y, BODY_W, h)
@@ -265,6 +270,7 @@ def draw_slide(prs, spec, chapter_label, page_no):
             for seg in payload.split("\n"):
                 p = btf.paragraphs[0] if first else btf.add_paragraph()
                 first = False
+                p.alignment = PP_ALIGN.LEFT
                 run = p.add_run()
                 run.text = seg
                 _set_font(run, pt, False, RGBColor(0x1F, 0x29, 0x37))
@@ -359,9 +365,20 @@ def build_docx(path):
                 tbl = doc.add_table(rows=rows, cols=cols)
                 tbl.style = "Table Grid"
                 tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+                tbl.autofit = False
+                total_cm = 16.6
+                widths = _table_widths(payload)
+                cm_widths = [Cm(total_cm * w / BODY_W) for w in widths]
+                for ci, cw in enumerate(cm_widths):
+                    tbl.columns[ci].width = cw
+                tblPr = tbl._tbl.tblPr
+                layout = OxmlElement("w:tblLayout")
+                layout.set(qn("w:type"), "fixed")
+                tblPr.append(layout)
                 for ri, row in enumerate(payload):
                     for ci, val in enumerate(row):
                         cell = tbl.cell(ri, ci)
+                        cell.width = cm_widths[ci]
                         cell.text = ""
                         run = cell.paragraphs[0].add_run(val)
                         if ri == 0:
